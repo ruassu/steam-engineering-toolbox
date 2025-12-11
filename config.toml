@@ -1,0 +1,16 @@
+unit_system = "SIBar"
+
+[default_units]
+temperature = "Celsius"
+temperature_diff = "Kelvin"
+pressure = "Bar"
+length = "Meter"
+area = "SquareMeter"
+volume = "CubicMeter"
+velocity = "MeterPerSecond"
+mass = "Kilogram"
+viscosity = "PascalSecond"
+energy = "Joule"
+heat_transfer = "WPerSquareMeterK"
+conductivity = "WPerMeterK"
+specific_enthalpy = "KjPerKg"

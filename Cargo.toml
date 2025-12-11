@@ -1,0 +1,20 @@
+[package]
+name = "steam_engineering_toolbox"
+version = "1.0.0-a"
+edition = "2021"
+default-run = "steam_engineering_toolbox"
+
+[[bin]]
+name = "steam_engineering_toolbox"
+path = "src/bin/gui.rs"
+
+[[bin]]
+name = "steam_engineering_toolbox_cli"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+eframe = "0.27"
+seuif97 = "1.1.4"
