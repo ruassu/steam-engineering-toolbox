@@ -21,11 +21,6 @@ cargo build --release
 - CLI: `steam_engineering_toolbox_cli --help`로 사용법 확인
 - 설정: 실행 디렉터리의 `config.toml`로 기본 단위/옵션 조정 가능
 
-## 배포/릴리스 가이드
-- 저장소에는 코드만 커밋하고, 빌드 산출물은 GitHub Releases에 업로드하세요.
-- 예시 패키지: `steam_engineering_toolbox_1.0.0-a_windows.zip` 안에 `steam_engineering_toolbox.exe`, `steam_engineering_toolbox_cli.exe`, `config.toml` 포함.
-- 릴리스 노트에 SHA256 해시를 함께 기재해 수신자가 무결성을 확인할 수 있게 합니다.
-
 ## 입력 팁
 - 거칠기 ε 기본값: 탄소강 배관 약 0.000045 m.
 - 음속 입력 시 Mach 자동 계산; 모르면 400~500 m/s 수준을 사용.
