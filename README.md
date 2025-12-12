@@ -1,5 +1,40 @@
 # Steam Engineering Toolbox
 
+Process engineering utilities for steam, gas, and water piping calculations, steam tables, and valve/cooling helpers. Both GUI (eframe) and CLI are available.
+
+## Key Features
+- Steam/air/gas/water/condensate piping pressure drop using Darcy-Weisbach with Haaland/Petukhov turbulent correlations, laminar 64/Re, fitting K values, and equivalent length support.
+- Steam properties via IF97 (seuif97) with pressure/temperature-driven density/viscosity estimation (falls back to provided inputs) including saturated and superheated calculations.
+- Valve/orifice Cv/Kv sizing plus cooling tower, condenser, and NPSH utilities.
+- Unit conversions and a default configuration (`config.toml`).
+
+## Build & Test
+Requires Rust 1.75+.
+```
+cargo test
+cargo build --release
+```
+Output binaries: `target/release/steam_engineering_toolbox.exe` and `steam_engineering_toolbox_cli.exe` (see the `release/` folder for bundled artifacts).
+
+## Run
+- GUI: `steam_engineering_toolbox.exe`
+- CLI: `steam_engineering_toolbox_cli --help` for usage
+- Settings: adjust default units/options via `config.toml` in the run directory
+
+## Input Tips
+- Default roughness ε: ~0.000045 m for carbon steel pipe.
+- Mach is auto-calculated from speed of sound; if unknown, try 400–500 m/s as a starting point.
+- For pressure drop, entering pressure (bar a) and temperature (°C) triggers IF97-based density/viscosity lookup; on failure, manual inputs are used.
+
+## Dependencies
+- `seuif97` (steam IF97 calculations)
+- `eframe/egui` (desktop GUI)
+
+---
+---
+
+# 스팀 엔지니어링 툴박스
+
 증기/가스/수 배관 계산, 증기표, 밸브·냉각 유틸리티를 포함한 공정 엔지니어링 도구입니다. GUI(eframe)와 CLI를 모두 제공합니다.
 
 ## 주요 기능
@@ -10,22 +45,3 @@
 
 ## 빌드 및 테스트
 Rust 1.75+ 기준.
-```
-cargo test
-cargo build --release
-```
-출력 바이너리: `target/release/steam_engineering_toolbox.exe`, `steam_engineering_toolbox_cli.exe` (release용 번들은 `release/` 폴더 참조).
-
-## 실행
-- GUI: `steam_engineering_toolbox.exe`
-- CLI: `steam_engineering_toolbox_cli --help`로 사용법 확인
-- 설정: 실행 디렉터리의 `config.toml`로 기본 단위/옵션 조정 가능
-
-## 입력 팁
-- 거칠기 ε 기본값: 탄소강 배관 약 0.000045 m.
-- 음속 입력 시 Mach 자동 계산; 모르면 400~500 m/s 수준을 사용.
-- 압력손실 계산에서 압력(bar a)·온도(°C)를 넣으면 IF97 기반 밀도/점도를 자동 사용하며, 실패 시 수동 입력값을 사용합니다.
-
-## 의존성
-- `seuif97` (증기 IF97 계산)
-- `eframe/egui` (데스크톱 GUI)
