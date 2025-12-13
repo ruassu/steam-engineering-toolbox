@@ -45,9 +45,6 @@ Release artifacts: `target/release/steam_engineering_toolbox.exe` and `steam_eng
 - For scripting or terminal use, run `steam_engineering_toolbox_cli --help` to see commands; typical usage is `steam_engineering_toolbox_cli pressure-drop --help`.
 - If property estimation looks off, override density/viscosity in the input fields or CLI flags; the app will use your manual values.
 
-## Release/Distribution Guide
-- Commit source only; upload built binaries to GitHub Releases.
-- Example package: `steam_engineering_toolbox_1.0.1_windows.zip` containing `steam_engineering_toolbox.exe`, `steam_engineering_toolbox_cli.exe`, and `config.toml`.
 
 ## Input Tips
 - Default pipe roughness epsilon: carbon steel ~0.000045 m.
