@@ -41,13 +41,17 @@ pub fn compute_cooling_tower(input: CoolingTowerInput) -> CoolingTowerResult {
 
     let mut warnings = Vec::new();
     if approach_c < 0.0 {
-        warnings.push("접근(Approach)이 음수입니다. 습구 온도보다 낮은 냉각은 불가능합니다.".into());
+        warnings
+            .push("접근(Approach)이 음수입니다. 습구 온도보다 낮은 냉각은 불가능합니다.".into());
     } else if approach_c < 2.0 {
         warnings.push("접근이 2°C 미만입니다. 실제 운전에서 달성하기 어려울 수 있습니다.".into());
     }
     if let Some(t) = input.target_range_c {
         if range_c < t {
-            warnings.push(format!("Range {:.1}°C가 목표 {:.1}°C보다 작습니다.", range_c, t));
+            warnings.push(format!(
+                "Range {:.1}°C가 목표 {:.1}°C보다 작습니다.",
+                range_c, t
+            ));
         }
     }
     if let Some(t) = input.target_approach_c {

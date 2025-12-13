@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::conversion;
+use crate::i18n::{self, Translator};
 use crate::steam::{steam_piping, steam_tables, steam_valves};
 use crate::ui_cli;
 use crate::ui_cli::MenuChoice;
@@ -76,20 +77,20 @@ impl From<steam_valves::ValveCalcError> for AppError {
 }
 
 /// CLI 애플리케이션의 메인 루프를 실행한다.
-pub fn run(config: &mut Config) -> Result<(), AppError> {
+pub fn run(config: &mut Config, tr: &Translator) -> Result<(), AppError> {
     loop {
-        match ui_cli::main_menu()? {
-            MenuChoice::UnitConversion => ui_cli::handle_unit_conversion(config)?,
-            MenuChoice::SteamTables => ui_cli::handle_steam_tables(config)?,
-            MenuChoice::SteamPiping => ui_cli::handle_steam_piping(config)?,
-            MenuChoice::SteamValves => ui_cli::handle_steam_valves(config)?,
+        match ui_cli::main_menu(tr)? {
+            MenuChoice::UnitConversion => ui_cli::handle_unit_conversion(tr, config)?,
+            MenuChoice::SteamTables => ui_cli::handle_steam_tables(tr, config)?,
+            MenuChoice::SteamPiping => ui_cli::handle_steam_piping(tr, config)?,
+            MenuChoice::SteamValves => ui_cli::handle_steam_valves(tr, config)?,
             MenuChoice::Settings => {
-                ui_cli::handle_settings(config)?;
+                ui_cli::handle_settings(tr, config)?;
                 config.save()?;
             }
             MenuChoice::Exit => {
                 config.save()?;
-                println!("프로그램을 종료합니다.");
+                println!("{}", tr.t(i18n::keys::APP_EXIT));
                 break;
             }
         }

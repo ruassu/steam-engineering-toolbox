@@ -48,6 +48,10 @@ pub struct PressureLossInput {
     pub dynamic_viscosity_pa_s: f64,
     /// 음속 [m/s] (증기 400~500 m/s 정도). Mach 계산용.
     pub sound_speed_m_per_s: f64,
+    /// 압력손실 계산용 상태 압력(절대 bar). 제공 시 IF97로 밀도/점도 계산에 사용.
+    pub state_pressure_bar_abs: Option<f64>,
+    /// 압력손실 계산용 상태 온도(°C). 제공 시 IF97로 밀도/점도 계산에 사용.
+    pub state_temperature_c: Option<f64>,
 }
 
 /// 압력손실 계산 결과.
@@ -102,12 +106,12 @@ pub fn pressure_loss(input: PressureLossInput) -> Result<PressureLossResult, Pip
             "질량유량, 직경, 길이는 0보다 커야 합니다.",
         ));
     }
+    let (steam_density_kg_per_m3, dyn_visc) = resolve_steam_props(&input);
     let mass_flow_kg_s = input.mass_flow_kg_per_h / 3600.0;
     let area = std::f64::consts::PI * input.diameter_m * input.diameter_m / 4.0;
-    let velocity = mass_flow_kg_s / (input.steam_density_kg_per_m3 * area);
+    let velocity = mass_flow_kg_s / (steam_density_kg_per_m3 * area);
 
-    let reynolds =
-        input.steam_density_kg_per_m3 * velocity * input.diameter_m / input.dynamic_viscosity_pa_s;
+    let reynolds = steam_density_kg_per_m3 * velocity * input.diameter_m / dyn_visc;
 
     // 단순 마찰계수 근사: 층류/난류 모두를 감안한 Petukhov 근사
     let friction_factor = if reynolds < 2300.0 {
@@ -115,7 +119,8 @@ pub fn pressure_loss(input: PressureLossInput) -> Result<PressureLossResult, Pip
     } else {
         let roughness_ratio = input.roughness_m / input.diameter_m;
         let log_term = (roughness_ratio / 3.7).powf(1.11) + 6.9 / reynolds;
-        0.25 / (log_term.log10().powi(2))
+        let inv_sqrt_f = -1.8 * log_term.log10();
+        1.0 / inv_sqrt_f.powi(2)
     };
 
     // 등가 길이: 직접 입력 + K값을 등가 길이로 환산
@@ -128,7 +133,7 @@ pub fn pressure_loss(input: PressureLossInput) -> Result<PressureLossResult, Pip
 
     let delta_p_pa = friction_factor
         * (total_length / input.diameter_m)
-        * input.steam_density_kg_per_m3
+        * steam_density_kg_per_m3
         * velocity
         * velocity
         / 2.0;
@@ -146,6 +151,44 @@ pub fn pressure_loss(input: PressureLossInput) -> Result<PressureLossResult, Pip
         friction_factor,
         mach,
     })
+}
+
+fn resolve_steam_props(input: &PressureLossInput) -> (f64, f64) {
+    if let (Some(p_bar_abs), Some(t_c)) = (input.state_pressure_bar_abs, input.state_temperature_c)
+    {
+        if let Ok((_, v, _)) = crate::steam::if97::region_props(p_bar_abs, t_c) {
+            if v.is_finite() && v > 0.0 {
+                let density = 1.0 / v;
+                let mu = steam_dynamic_viscosity_pa_s(t_c, density);
+                return (density, mu);
+            }
+        }
+    }
+    (input.steam_density_kg_per_m3, input.dynamic_viscosity_pa_s)
+}
+
+fn steam_dynamic_viscosity_pa_s(temp_c: f64, density: f64) -> f64 {
+    // 증기/과열 영역은 서덜랜드 근사, 액체 영역은 일반적인 물 점도 근사 사용
+    let temp_k = temp_c + 273.15;
+    if density > 50.0 {
+        liquid_water_viscosity(temp_c)
+    } else {
+        steam_vapor_viscosity(temp_k)
+    }
+}
+
+fn steam_vapor_viscosity(temp_k: f64) -> f64 {
+    // 간단한 서덜랜드 근사 (기본값: 300K에서 약 1.3e-5 Pa·s)
+    let t0 = 300.0;
+    let mu0 = 1.3e-5;
+    let s = 111.0;
+    mu0 * (temp_k / t0).powf(1.5) * (t0 + s) / (temp_k + s)
+}
+
+fn liquid_water_viscosity(temp_c: f64) -> f64 {
+    // 0~370°C 범위에서 흔히 쓰이는 물 점도 근사식 [Pa·s]
+    let exponent = 247.8 / (temp_c + 133.15);
+    2.414e-5 * 10f64.powf(exponent)
 }
 
 /// 이상기체 근사로 증기 밀도를 계산한다. (압력 입력은 게이지 bar로 가정)

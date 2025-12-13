@@ -61,10 +61,7 @@ pub fn compute_pump_npsh(input: PumpNpshInput) -> PumpNpshResult {
     };
     let mut warnings = Vec::new();
     if margin < 1.1 {
-        warnings.push(format!(
-            "NPSH Margin {:.2} (<1.1). 공동현상 위험.",
-            margin
-        ));
+        warnings.push(format!("NPSH Margin {:.2} (<1.1). 공동현상 위험.", margin));
     }
     PumpNpshResult {
         npsha_m: npsha,

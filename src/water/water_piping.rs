@@ -41,7 +41,8 @@ pub fn water_pressure_loss(input: WaterPressureLossInput) -> WaterPressureLossRe
     } else {
         let roughness_ratio = input.roughness_m / input.diameter_m;
         let log_term = (roughness_ratio / 3.7).powf(1.11) + 6.9 / reynolds;
-        0.25 / (log_term.log10().powi(2))
+        let inv_sqrt_f = -1.8 * log_term.log10();
+        1.0 / inv_sqrt_f.powi(2)
     };
 
     let delta_p_pa = friction_factor

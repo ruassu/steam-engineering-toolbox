@@ -3,10 +3,14 @@
 //! eframe/egui 기반 데스크톱 GUI 진입점.
 
 use eframe::{egui, App, Frame};
-use std::{fs, path::Path};
+use image::GenericImageView;
+use rfd::FileDialog;
+use std::{env, fs, path::Path};
 use steam_engineering_toolbox::{
     config, conversion,
     cooling::{condenser, cooling_tower, drain_cooler, pump_npsh},
+    i18n,
+    material_db,
     quantity::QuantityKind,
     steam,
     steam::steam_piping::PipeSizingByVelocityInput,
@@ -15,21 +19,69 @@ use steam_engineering_toolbox::{
 };
 
 fn main() -> Result<(), eframe::Error> {
+    // CLI 언어 옵션 처리: --lang xx 또는 --lang=xx (xx: auto/en-us/en-uk/ko-kr/ko)
+    let mut cli_lang: Option<String> = None;
+    let args: Vec<String> = env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(val) = a.strip_prefix("--lang=") {
+            cli_lang = Some(val.to_string());
+        } else if a == "--lang" || a == "-L" {
+            if i + 1 < args.len() {
+                cli_lang = Some(args[i + 1].clone());
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+
+    let icon_data = load_app_icon();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_always_on_top()
+        .with_transparent(true);
+    if let Some(icon) = icon_data.clone() {
+        viewport = viewport.with_icon(icon);
+    }
     let cfg = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_always_on_top(),
+        viewport,
         ..Default::default()
     };
-    let app_cfg = config::load_or_default().unwrap_or_default();
+    let mut app_cfg = config::load_or_default().unwrap_or_default();
+    if let Some(lang_cli) = cli_lang {
+        let resolved = i18n::resolve_language(&lang_cli, Some(app_cfg.language.as_str()));
+        app_cfg.language = resolved;
+    }
     eframe::run_native(
         "Steam Engineering Toolbox",
         cfg,
         Box::new(move |cc| {
             if let Err(e) = setup_fonts(&cc.egui_ctx) {
-                eprintln!("폰트 설정 실패: {e}");
+                eprintln!("Font error: {e}");
             }
             Box::new(GuiApp::new(app_cfg.clone()))
         }),
     )
+}
+
+fn load_app_icon() -> Option<egui::IconData> {
+    let search = [
+        "SE_Cal.png",
+        "icon.png",
+        "assets/icon.png",
+        "../SE_Cal.png",
+        "../../SE_Cal.png",
+    ];
+    let path = search.iter().find(|p| Path::new(*p).exists()).map(|s| s.to_string())?;
+    let bytes = fs::read(&path).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = img.dimensions();
+    Some(egui::IconData {
+        rgba: rgba.into_raw(),
+        width: w,
+        height: h,
+    })
 }
 
 fn stroke_based_kv_available(strokes: &[f64], cvs: &[f64]) -> bool {
@@ -83,9 +135,41 @@ fn heading_with_tip(ui: &mut egui::Ui, text: &str, tip: &str) -> egui::Response 
     ui.heading(text).on_hover_text(tip)
 }
 
+fn fill_template(template: &str, vars: &[(&str, String)]) -> String {
+    let mut out = template.to_string();
+    for (k, v) in vars {
+        out = out.replace(&format!("{{{k}}}"), v);
+    }
+    out
+}
+
+fn legend_toggle(ui: &mut egui::Ui, title: &str, body: &str, state: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.checkbox(state, title);
+    });
+    if *state {
+        ui.add(
+            egui::Label::new(egui::RichText::new(body).small())
+                .wrap(true),
+        );
+    }
+}
+
 struct GuiApp {
     config: config::Config,
+    tr: i18n::Translator,
+    lang_input: String,
+    lang_pack_dir_input: String,
+    lang_save_status: Option<String>,
     tab: Tab,
+    window_alpha: f32,
+    show_formula_modal: bool,
+    // 해설 토글
+    show_legend_steam: bool,
+    show_legend_pipe: bool,
+    show_legend_pipe_loss: bool,
+    show_legend_valve: bool,
+    show_legend_plant: bool,
     // 단위 변환
     conv_value: f64,
     conv_from: String,
@@ -120,6 +204,8 @@ struct GuiApp {
     pipe_vel_out_unit: String,
     pipe_result: Option<String>,
     pipe_loss_density: f64,
+    pipe_loss_pressure_bar_abs: f64,
+    pipe_loss_temperature_c: f64,
     pipe_loss_diameter: f64,
     pipe_loss_length: f64,
     pipe_loss_eq_length: f64,
@@ -381,7 +467,7 @@ fn setup_fonts(ctx: &egui::Context) -> Result<(), String> {
     // 1) 프로젝트 내 폰트
     let asset_path = Path::new("assets/fonts/malgun.ttf");
     if asset_path.exists() {
-        let bytes = fs::read(asset_path).map_err(|e| format!("폰트 파일 읽기 실패: {e}"))?;
+        let bytes = fs::read(asset_path).map_err(|e| format!("Failed to read font file: {e}"))?;
         apply_font_bytes(ctx, bytes, "korean_font");
         return Ok(());
     }
@@ -401,7 +487,7 @@ fn setup_fonts(ctx: &egui::Context) -> Result<(), String> {
             let p = fonts.join(cand);
             if p.exists() {
                 let bytes = fs::read(&p)
-                    .map_err(|e| format!("시스템 폰트 읽기 실패({}): {e}", p.display()))?;
+                    .map_err(|e| format!("Failed to read system font ({}): {e}", p.display()))?;
                 apply_font_bytes(ctx, bytes, "korean_font");
                 return Ok(());
             }
@@ -409,22 +495,28 @@ fn setup_fonts(ctx: &egui::Context) -> Result<(), String> {
     }
 
     // 3) 실패: 기본 폰트 유지, 사용자 지정 안내
-    Err("폰트를 찾지 못했습니다. 설정에서 사용자 폰트(.ttf/.ttc)를 지정해주세요.".into())
+    Err("Font not found. Please set a user font (.ttf/.ttc) in settings.".into())
 }
 
 /// 사용자가 선택한 경로의 폰트를 egui에 등록한다.
 fn load_custom_font(ctx: &egui::Context, path: &str) -> Result<(), String> {
     let p = Path::new(path);
     if !p.exists() {
-        return Err(format!("폰트 파일을 찾을 수 없습니다: {path}"));
+        return Err(format!("Font file not found: {path}"));
     }
-    let bytes = fs::read(p).map_err(|e| format!("폰트 파일 읽기 실패: {e}"))?;
+    let bytes = fs::read(p).map_err(|e| format!("Failed to read font file: {e}"))?;
     apply_font_bytes(ctx, bytes, "user_font");
     Ok(())
 }
 
-fn vacuum_table_ui(ui: &mut egui::Ui) {
-    ui.small("압력을 mmHg(g)로 놓고, IF97 포화온도 계산 결과를 표로 표시합니다.");
+fn vacuum_table_ui<F>(ui: &mut egui::Ui, txt: &F)
+where
+    F: Fn(&str, &str) -> String,
+{
+    ui.small(txt(
+        "gui.steam.vacuum_table.intro",
+        "Fix pressure to mmHg (gauge) and show IF97 saturation temps.",
+    ));
     egui::Grid::new(ui.next_auto_id())
         .num_columns(3)
         .spacing([8.0, 4.0])
@@ -435,9 +527,11 @@ fn vacuum_table_ui(ui: &mut egui::Ui) {
             ui.end_row();
             let rows = [
                 0.0, -100.0, -200.0, -300.0, -400.0, // 100단계
-                -420.0, -440.0, -460.0, -480.0, -500.0, -520.0, -540.0, -560.0, -580.0, -600.0, // 20단계
+                -420.0, -440.0, -460.0, -480.0, -500.0, -520.0, -540.0, -560.0, -580.0,
+                -600.0, // 20단계
                 -610.0, -620.0, -630.0, -640.0, -650.0, -660.0, -670.0, -680.0, // 10단계
-                -685.0, -690.0, -695.0, -700.0, -705.0, -710.0, -715.0, -720.0, -725.0, -730.0, -735.0, -740.0, // 5단계
+                -685.0, -690.0, -695.0, -700.0, -705.0, -710.0, -715.0, -720.0, -725.0, -730.0,
+                -735.0, -740.0, // 5단계
                 -760.0, // -740~-760은 20 단위(끝값만 표시)
             ];
             for mmhg_g in rows {
@@ -462,9 +556,26 @@ fn vacuum_table_ui(ui: &mut egui::Ui) {
 impl GuiApp {
     fn new(config: config::Config) -> Self {
         let (conv_from, conv_to) = default_units_for_kind(QuantityKind::Temperature);
+        let lang_code = i18n::resolve_language("auto", Some(config.language.as_str()));
+        let tr = i18n::Translator::new_with_pack(&lang_code, config.language_pack_dir.as_deref());
+        let has_overrides = tr.lookup("gui.nav.app_title").is_some();
+        eprintln!("GUI language resolved: {lang_code}, overrides_loaded={has_overrides}");
+        let lang_input = config.language.clone();
+        let lang_pack_dir_input = config.language_pack_dir.clone().unwrap_or_default();
         let mut s = Self {
-            config,
+            config: config.clone(),
+            tr,
+            lang_input,
+            lang_pack_dir_input,
+            lang_save_status: None,
             tab: Tab::UnitConv,
+            window_alpha: config.window_alpha.clamp(0.3, 1.0),
+            show_formula_modal: false,
+            show_legend_steam: false,
+            show_legend_pipe: false,
+            show_legend_pipe_loss: false,
+            show_legend_valve: false,
+            show_legend_plant: false,
             conv_value: 100.0,
             conv_from: conv_from.into(),
             conv_to: conv_to.into(),
@@ -496,6 +607,8 @@ impl GuiApp {
             pipe_vel_out_unit: "m/s".into(),
             pipe_result: None,
             pipe_loss_density: 2.5,
+            pipe_loss_pressure_bar_abs: 6.0,
+            pipe_loss_temperature_c: 180.0,
             pipe_loss_diameter: 0.1,
             pipe_loss_length: 50.0,
             pipe_loss_eq_length: 0.0,
@@ -568,13 +681,13 @@ impl GuiApp {
             plant_gamma: 1.3,
             plant_compressible: false,
             plant_result: None,
-            plant_mat: "ASTM A106 Gr.B".into(),
+            plant_mat: "A106B".into(),
             plant_length_m: 10.0,
             plant_delta_t: 50.0,
             plant_alpha_override: 0.0,
             plant_expansion_result: None,
-            plant_pipe_od_m: 0.114,   // NPS 4" OD 약 114mm
-            plant_wall_thk_m: 0.006,  // 6mm
+            plant_pipe_od_m: 0.114,  // NPS 4" OD 약 114mm
+            plant_wall_thk_m: 0.006, // 6mm
             plant_dim_unit: "mm".into(),
             plant_service_temp_c: 20.0,
             plant_allow_stress_mpa: 138.0, // A106B room temp 허용응력 근사
@@ -850,19 +963,21 @@ impl GuiApp {
     }
     /// 사이드 메뉴를 제공한다.
     fn ui_nav(&mut self, ui: &mut egui::Ui) {
+        let tr = self.tr.clone();
+        let txt = |key: &str, default: &str| tr.lookup(key).unwrap_or_else(|| default.to_string());
         ui.style_mut().wrap = Some(false);
         ui.vertical_centered(|ui| {
-            ui.heading("메뉴");
+            ui.heading(txt("gui.nav.heading", "Menu"));
             ui.add_space(8.0);
         });
         for (tab, label) in [
-            (Tab::SteamTables, "Steam Tables / 증기표"),
-            (Tab::UnitConv, "Unit Converter / 단위변환"),
-            (Tab::SteamPiping, "Steam Piping / 증기 배관"),
-            (Tab::SteamValves, "Steam Valves / 밸브·오리피스"),
-            (Tab::Boiler, "Boiler Efficiency / 보일러 효율"),
-            (Tab::Cooling, "Cooling/Condensing / 냉각·복수"),
-            (Tab::PlantPiping, "Plant Piping / 플랜트 배관"),
+            (Tab::SteamTables, txt("gui.tab.steam_tables", "Steam Tables")),
+            (Tab::UnitConv, txt("gui.tab.unit_conv", "Unit Converter")),
+            (Tab::SteamPiping, txt("gui.tab.steam_piping", "Steam Piping")),
+            (Tab::SteamValves, txt("gui.tab.steam_valves", "Steam Valves")),
+            (Tab::Boiler, txt("gui.tab.boiler", "Boiler Efficiency")),
+            (Tab::Cooling, txt("gui.tab.cooling", "Cooling/Condensing")),
+            (Tab::PlantPiping, txt("gui.tab.plant_piping", "Plant Piping")),
         ] {
             let selected = self.tab == tab;
             let button = egui::Button::new(label)
@@ -872,17 +987,35 @@ impl GuiApp {
                     ui.visuals().extreme_bg_color
                 })
                 .min_size(egui::vec2(ui.available_width(), 32.0));
-            let resp = ui.add(button).on_hover_text("메뉴 전환");
+            let resp = ui
+                .add(button)
+                .on_hover_text(txt("gui.nav.switch_tip", "Switch menu"));
             if resp.clicked() {
-                    self.tab = tab;
+                self.tab = tab;
             }
             ui.add_space(4.0);
         }
     }
 
     fn ui_unit_conv(&mut self, ui: &mut egui::Ui) {
-        heading_with_tip(ui, "Unit Converter", "여러 물리량을 서로 다른 단위로 변환하는 도구");
-        label_with_tip(ui, "카드형 입력 UI", "좌측에서 값을 입력하고 단위를 선택한 뒤 변환 실행을 누릅니다.");
+        let tr = self.tr.clone();
+        let txt = |key: &str, default: &str| tr.lookup(key).unwrap_or_else(|| default.to_string());
+        heading_with_tip(
+            ui,
+            &txt("gui.unit.heading", "Unit Converter"),
+            &txt(
+                "gui.unit.tip",
+                "Convert various physical quantities between units.",
+            ),
+        );
+        label_with_tip(
+            ui,
+            &txt("gui.unit.card_label", "Card-style input"),
+            &txt(
+                "gui.unit.card_tip",
+                "Enter value and select units, then run conversion.",
+            ),
+        );
         ui.add_space(8.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.vertical(|ui| {
@@ -890,13 +1023,67 @@ impl GuiApp {
                     .num_columns(2)
                     .spacing([12.0, 8.0])
                     .show(ui, |ui| {
-                        label_with_tip(ui, "물리량", "온도·압력·길이 등 변환하려는 물리량 종류");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.unit.quantity.label", "Quantity"),
+                        &txt("gui.unit.quantity_tip", "Select the quantity type"),
+                    );
                         let before = self.conv_kind;
+                        let q_options = vec![
+                            (
+                                QuantityKind::Temperature,
+                                txt("gui.unit.quantity.temperature", "Temperature"),
+                            ),
+                            (
+                                QuantityKind::TemperatureDifference,
+                                txt("gui.unit.quantity.temperature_diff", "ΔTemperature"),
+                            ),
+                            (
+                                QuantityKind::Pressure,
+                                txt("gui.unit.quantity.pressure", "Pressure"),
+                            ),
+                            (QuantityKind::Length, txt("gui.unit.quantity.length", "Length")),
+                            (QuantityKind::Area, txt("gui.unit.quantity.area", "Area")),
+                            (QuantityKind::Volume, txt("gui.unit.quantity.volume", "Volume")),
+                            (
+                                QuantityKind::Velocity,
+                                txt("gui.unit.quantity.velocity", "Velocity"),
+                            ),
+                            (QuantityKind::Mass, txt("gui.unit.quantity.mass", "Mass")),
+                            (
+                                QuantityKind::Viscosity,
+                                txt("gui.unit.quantity.viscosity", "Viscosity"),
+                            ),
+                            (QuantityKind::Energy, txt("gui.unit.quantity.energy", "Energy")),
+                            (
+                                QuantityKind::HeatTransferCoeff,
+                                txt(
+                                    "gui.unit.quantity.heat_transfer_coeff",
+                                    "Heat transfer coeff.",
+                                ),
+                            ),
+                            (
+                                QuantityKind::ThermalConductivity,
+                                txt(
+                                    "gui.unit.quantity.thermal_conductivity",
+                                    "Thermal conductivity",
+                                ),
+                            ),
+                            (
+                                QuantityKind::SpecificEnthalpy,
+                                txt("gui.unit.quantity.specific_enthalpy", "Specific enthalpy"),
+                            ),
+                        ];
+                        let selected_label = q_options
+                            .iter()
+                            .find(|(k, _)| *k == self.conv_kind)
+                            .map(|(_, l)| l.clone())
+                            .unwrap_or_else(|| txt("gui.unit.quantity.label", "Quantity"));
                         egui::ComboBox::from_id_source("conv_kind")
-                            .selected_text(kind_label(self.conv_kind))
+                            .selected_text(selected_label)
                             .show_ui(ui, |ui| {
-                                for (k, label) in quantity_options() {
-                                    ui.selectable_value(&mut self.conv_kind, k, label);
+                                for (k, label) in &q_options {
+                                    ui.selectable_value(&mut self.conv_kind, *k, label.clone());
                                 }
                             });
                         if before != self.conv_kind {
@@ -906,11 +1093,19 @@ impl GuiApp {
                         }
                         ui.end_row();
 
-                        label_with_tip(ui, "값", "변환 대상 수치를 입력");
+                        label_with_tip(
+                            ui,
+                            &txt("gui.unit.value", "Value"),
+                            &txt("gui.unit.value_tip", "Enter the value to convert"),
+                        );
                         ui.add(egui::DragValue::new(&mut self.conv_value).speed(1.0));
                         ui.end_row();
 
-                        label_with_tip(ui, "입력 단위", "현재 값의 단위를 선택");
+                        label_with_tip(
+                            ui,
+                            &txt("gui.unit.from", "From unit"),
+                            &txt("gui.unit.from_tip", "Current unit of the value"),
+                        );
                         egui::ComboBox::from_id_source("conv_from")
                             .selected_text(unit_label(&self.conv_from, self.conv_kind))
                             .show_ui(ui, |ui| {
@@ -924,7 +1119,11 @@ impl GuiApp {
                             });
                         ui.end_row();
 
-                        label_with_tip(ui, "출력 단위", "변환 후 받고 싶은 단위");
+                        label_with_tip(
+                            ui,
+                            &txt("gui.unit.to", "To unit"),
+                            &txt("gui.unit.to_tip", "Desired unit after conversion"),
+                        );
                         egui::ComboBox::from_id_source("conv_to")
                             .selected_text(unit_label(&self.conv_to, self.conv_kind))
                             .show_ui(ui, |ui| {
@@ -939,7 +1138,7 @@ impl GuiApp {
                         ui.end_row();
                     });
                 ui.add_space(8.0);
-                if ui.button("변환 실행").clicked() {
+                if ui.button(txt("gui.unit.run", "Convert")).clicked() {
                     self.conv_result = match conversion::convert(
                         self.conv_kind,
                         self.conv_value,
@@ -947,7 +1146,10 @@ impl GuiApp {
                         self.conv_to.trim(),
                     ) {
                         Ok(v) => Some(format!("{v:.6} {}", self.conv_to.trim())),
-                        Err(e) => Some(format!("오류: {e}")),
+                        Err(e) => Some(format!(
+                            "{}: {e}",
+                            txt("gui.unit.error_prefix", "Error")
+                        )),
                     };
                 }
                 if let Some(res) = &self.conv_result {
@@ -958,80 +1160,166 @@ impl GuiApp {
     }
 
     fn ui_steam_tables(&mut self, ui: &mut egui::Ui) {
-        heading_with_tip(ui, "Steam Tables", "IAPWS-IF97 기반 증기/수 상태량 계산 (포화/과열)");
+        let tr = self.tr.clone();
+        let txt = |key: &str, default: &str| tr.lookup(key).unwrap_or_else(|| default.to_string());
+        heading_with_tip(
+            ui,
+            &txt("gui.steam.heading", "Steam Tables"),
+            &txt(
+                "gui.steam.tip",
+                "Steam/water properties (sat/superheated) based on IF97.",
+            ),
+        );
         label_with_tip(
             ui,
-            "포화/과열 입력 카드 (h/s/v 포함)",
-            "압력·온도로 포화/과열 상태를 지정해 Psat, Tsat, h, s, v를 조회합니다.",
+            &txt("gui.steam.card_label", "Saturation/Superheat card"),
+            &txt(
+                "gui.steam.card_tip",
+                "Enter pressure/temperature to get Psat/Tsat/h/s/v.",
+            ),
         );
         ui.add_space(8.0);
         if ui
-            .button("진공 포화온도 표 열기")
-            .on_hover_text("mmHg 게이지 기준 포화온도 표를 내장 창으로 표시")
+            .button(txt("gui.steam.vacuum_open", "Open vacuum table"))
+            .on_hover_text(txt(
+                "gui.steam.vacuum_open_tip",
+                "Show built-in vacuum saturation table (mmHg gauge).",
+            ))
             .clicked()
         {
             self.show_vacuum_table_window = true;
         }
         ui.horizontal(|ui| {
             if ui
-                .button("진공 포화온도 표 새 창")
-                .on_hover_text("별도 윈도우로 띄워놓고 다른 메뉴를 사용할 수 있습니다.")
+                .button(txt("gui.steam.vacuum_window", "Open vacuum table in new window"))
+                .on_hover_text(txt(
+                    "gui.steam.vacuum_window_tip",
+                    "Open vacuum table in a separate window.",
+                ))
                 .clicked()
             {
                 self.show_vacuum_table_viewport = true;
             }
-            ui.small("※ 외부 창으로 띄워두고 다른 메뉴 탐색 가능");
+            ui.small(txt(
+                "gui.steam.vacuum_note",
+                "You can keep the external window open while using other menus.",
+            ));
         });
         if self.show_vacuum_table_window {
-            egui::Window::new("진공 포화온도 표 (mmHg 게이지 기준 0=대기, -760=진공)")
+            egui::Window::new(txt(
+                "gui.steam.vacuum_title",
+                "Vacuum saturation table (mmHg gauge: 0=atm, -760=vacuum)",
+            ))
                 .open(&mut self.show_vacuum_table_window)
                 .scroll2([true, true])
                 .resizable(true)
                 .show(ui.ctx(), |ui| {
-                    vacuum_table_ui(ui);
+                    vacuum_table_ui(ui, &txt);
                 });
         }
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.steam_mode, SteamMode::ByPressure, "압력 기준")
-                    .on_hover_text("압력을 입력해 포화온도/엔탈피/엔트로피를 계산");
-                ui.selectable_value(&mut self.steam_mode, SteamMode::ByTemperature, "온도 기준")
-                    .on_hover_text("온도를 입력해 포화압력/엔탈피/엔트로피를 계산");
-                ui.selectable_value(&mut self.steam_mode, SteamMode::Superheated, "과열")
-                    .on_hover_text("압력+과열온도를 입력해 과열 증기 상태량 계산");
+                ui.selectable_value(
+                    &mut self.steam_mode,
+                    SteamMode::ByPressure,
+                    txt("gui.steam.mode.pressure", "By pressure"),
+                )
+                .on_hover_text(txt(
+                    "gui.steam.mode.pressure_tip",
+                    "Enter pressure to get Psat/Tsat/h/s/v.",
+                ));
+                ui.selectable_value(
+                    &mut self.steam_mode,
+                    SteamMode::ByTemperature,
+                    txt("gui.steam.mode.temperature", "By temperature"),
+                )
+                .on_hover_text(txt(
+                    "gui.steam.mode.temperature_tip",
+                    "Enter temperature to get Psat/Tsat/h/s/v.",
+                ));
+                ui.selectable_value(
+                    &mut self.steam_mode,
+                    SteamMode::Superheated,
+                    txt("gui.steam.mode.superheated", "Superheated"),
+                )
+                .on_hover_text(txt(
+                    "gui.steam.mode.superheated_tip",
+                    "Enter P+superheat to get superheated properties.",
+                ));
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                label_with_tip(ui, "값", "현재 모드에서 입력하는 압력 또는 온도");
+                label_with_tip(
+                    ui,
+                    &txt("gui.steam.value", "Value"),
+                    &txt(
+                        "gui.steam.value_tip",
+                        "Pressure or temperature depending on mode",
+                    ),
+                );
                 ui.add(egui::DragValue::new(&mut self.steam_value).speed(0.5));
                 if matches!(self.steam_mode, SteamMode::ByPressure | SteamMode::Superheated) {
                     unit_combo(ui, &mut self.steam_p_unit, pressure_unit_options());
-                    ui.selectable_value(&mut self.steam_p_mode, conversion::PressureMode::Gauge, "Gauge (G)");
-                    ui.selectable_value(&mut self.steam_p_mode, conversion::PressureMode::Absolute, "Absolute (A)");
+                    ui.selectable_value(
+                        &mut self.steam_p_mode,
+                        conversion::PressureMode::Gauge,
+                        "Gauge (G)",
+                    );
+                    ui.selectable_value(
+                        &mut self.steam_p_mode,
+                        conversion::PressureMode::Absolute,
+                        "Absolute (A)",
+                    );
                 } else {
                     unit_combo(ui, &mut self.steam_t_unit, temperature_unit_options());
                 }
             });
             if self.steam_mode == SteamMode::Superheated {
                 ui.horizontal(|ui| {
-                    label_with_tip(ui, "과열 온도 [°C]", "포화점 대비 과열 온도 (절대 온도가 아님)");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.steam.superheat", "Superheat [°C]"),
+                        &txt(
+                            "gui.steam.superheat_tip",
+                            "Superheat above saturation (not absolute temperature)",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.steam_temp_input).speed(1.0));
                     unit_combo(ui, &mut self.steam_t_unit, temperature_unit_options());
                 });
             }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                label_with_tip(ui, "출력 압력 단위", "계산 결과를 표시할 압력 단위");
+                label_with_tip(
+                    ui,
+                    &txt("gui.steam.output_pressure", "Output pressure unit"),
+                    &txt("gui.steam.output_pressure_tip", "Pressure unit for results"),
+                );
                 unit_combo(ui, &mut self.steam_p_unit_out, pressure_unit_options());
-                ui.selectable_value(&mut self.steam_p_mode_out, conversion::PressureMode::Gauge, "Gauge (G)");
-                ui.selectable_value(&mut self.steam_p_mode_out, conversion::PressureMode::Absolute, "Absolute (A)");
-                label_with_tip(ui, "출력 온도 단위", "계산 결과를 표시할 온도 단위");
+                ui.selectable_value(
+                    &mut self.steam_p_mode_out,
+                    conversion::PressureMode::Gauge,
+                    "Gauge (G)",
+                );
+                ui.selectable_value(
+                    &mut self.steam_p_mode_out,
+                    conversion::PressureMode::Absolute,
+                    "Absolute (A)",
+                );
+                label_with_tip(
+                    ui,
+                    &txt("gui.steam.output_temperature", "Output temperature unit"),
+                    &txt("gui.steam.output_temperature_tip", "Temperature unit for results"),
+                );
                 unit_combo(ui, &mut self.steam_t_unit_out, temperature_unit_options());
             });
-            ui.small("Tip: mmHg는 게이지 기준(0=대기, -760mmHg=완전진공)으로 처리됩니다.");
+            ui.small(txt(
+                "gui.steam.tip_mmhg",
+                "Tip: mmHg is treated as gauge (0=atm, -760=vacuum).",
+            ));
             ui.add_space(6.0);
-            if ui.button("계산").clicked() {
+            if ui.button(txt("gui.steam.run", "Calculate")).clicked() {
                 self.steam_result = Some(match self.steam_mode {
                     SteamMode::ByPressure => match steam::saturation_by_pressure_mode(
                         convert_pressure_mode_gui(
@@ -1045,123 +1333,194 @@ impl GuiApp {
                         conversion::PressureMode::Absolute,
                     ) {
                         Ok(s) => {
-                            let p_out = convert_pressure_mode_gui(
-                                s.pressure_bar,
-                                "bar",
-                                conversion::PressureMode::Absolute,
-                                &self.steam_p_unit_out,
-                                self.steam_p_mode_out,
-                            );
-                            let t_out = convert_temperature_gui(s.saturation_temperature_c, "C", &self.steam_t_unit_out);
-                            format!(
-                                "Psat={:.3} {}, Tsat={:.2} {}, hs(v)={:.1} kJ/kg, vs={:.3} m3/kg, ss={:.3} kJ/kgK | hf={:.1} kJ/kg, vf={:.4} m3/kg, sf={:.3} kJ/kgK",
-                                p_out,
-                                self.steam_p_unit_out,
-                                t_out,
-                                self.steam_t_unit_out,
-                                s.saturation_enthalpy_kj_per_kg,
-                                s.saturation_specific_volume,
-                                s.saturation_entropy_kj_per_kgk,
-                                s.sat_liquid_enthalpy_kj_per_kg,
-                                s.sat_liquid_specific_volume,
-                                s.sat_liquid_entropy_kj_per_kgk
-                            )
-                        }
-                        Err(e) => format!(
-                            "오류(P={:.3} {}{}): {e}",
-                            self.steam_value,
-                            self.steam_p_unit,
-                            if self.steam_p_mode == conversion::PressureMode::Gauge {
-                                "g"
-                            } else {
-                                "a"
-                            }
-                        ),
-                    },
-                    SteamMode::ByTemperature => match steam::saturation_by_temperature(
-                        convert_temperature_gui(self.steam_value, &self.steam_t_unit, "C"),
-                        TemperatureUnit::Celsius,
-                    ) {
-                        Ok(s) => {
-                            let p_out = convert_pressure_mode_gui(
-                                s.pressure_bar,
-                                "bar",
-                                conversion::PressureMode::Absolute,
-                                &self.steam_p_unit_out,
-                                self.steam_p_mode_out,
-                            );
-                            format!(
-                                "Psat={:.3} {}, hs={:.1} kJ/kg, v={:.3} m3/kg",
-                                p_out,
-                                self.steam_p_unit_out,
-                                s.saturation_enthalpy_kj_per_kg,
-                                s.saturation_specific_volume
-                            )
-                        }
-                        Err(e) => format!(
-                            "오류(T={:.2} {}): {e}",
-                            self.steam_value, self.steam_t_unit
-                        ),
-                    },
-                    SteamMode::Superheated => match steam::superheated_at(
-                        convert_pressure_mode_gui(
-                            self.steam_value,
-                            &self.steam_p_unit,
+                        let p_out = convert_pressure_mode_gui(
+                            s.pressure_bar,
+                            "bar",
+                            conversion::PressureMode::Absolute,
+                            &self.steam_p_unit_out,
+                            self.steam_p_mode_out,
+                        );
+                        let t_out =
+                            convert_temperature_gui(s.saturation_temperature_c, "C", &self.steam_t_unit_out);
+                        let tpl = txt(
+                            "gui.steam.result.sat_full",
+                            "Psat={psat} {p_unit}, Tsat={tsat} {t_unit}, hs(v)={hs} kJ/kg, vs={vs} m3/kg, ss={ss} kJ/kgK | hf={hf} kJ/kg, vf={vf} m3/kg, sf={sf} kJ/kgK",
+                        );
+                        fill_template(
+                            &tpl,
+                            &[
+                                ("psat", format!("{:.3}", p_out)),
+                                ("p_unit", self.steam_p_unit_out.clone()),
+                                ("tsat", format!("{:.2}", t_out)),
+                                ("t_unit", self.steam_t_unit_out.clone()),
+                                ("hs", format!("{:.1}", s.saturation_enthalpy_kj_per_kg)),
+                                ("vs", format!("{:.3}", s.saturation_specific_volume)),
+                                ("ss", format!("{:.3}", s.saturation_entropy_kj_per_kgk)),
+                                ("hf", format!("{:.1}", s.sat_liquid_enthalpy_kj_per_kg)),
+                                ("vf", format!("{:.4}", s.sat_liquid_specific_volume)),
+                                ("sf", format!("{:.3}", s.sat_liquid_entropy_kj_per_kgk)),
+                            ],
+                        )
+                    }
+                    Err(e) => {
+                        let tpl = txt(
+                            "gui.steam.error.pressure",
+                            "Error(P={p} {p_unit}{mode}): {e}",
+                        );
+                        let mode = if self.steam_p_mode == conversion::PressureMode::Gauge {
+                            "g"
+                        } else {
+                            "a"
+                        };
+                        fill_template(
+                            &tpl,
+                            &[
+                                ("p", format!("{:.3}", self.steam_value)),
+                                ("p_unit", self.steam_p_unit.clone()),
+                                ("mode", mode.to_string()),
+                                ("e", e.to_string()),
+                            ],
+                        )
+                    }
+                },
+            SteamMode::ByTemperature => match steam::saturation_by_temperature(
+                convert_temperature_gui(self.steam_value, &self.steam_t_unit, "C"),
+                TemperatureUnit::Celsius,
+            ) {
+                Ok(s) => {
+                        let p_out = convert_pressure_mode_gui(
+                            s.pressure_bar,
+                            "bar",
+                            conversion::PressureMode::Absolute,
+                            &self.steam_p_unit_out,
+                            self.steam_p_mode_out,
+                        );
+                        let tpl = txt(
+                            "gui.steam.result.sat_temp",
+                            "Psat={psat} {p_unit}, hs={hs} kJ/kg, v={v} m3/kg",
+                        );
+                        fill_template(
+                            &tpl,
+                            &[
+                                ("psat", format!("{:.3}", p_out)),
+                                ("p_unit", self.steam_p_unit_out.clone()),
+                                ("hs", format!("{:.1}", s.saturation_enthalpy_kj_per_kg)),
+                                ("v", format!("{:.3}", s.saturation_specific_volume)),
+                            ],
+                        )
+                    }
+                    Err(e) => {
+                        let tpl = txt("gui.steam.error.temperature", "Error(T={t} {t_unit}): {e}");
+                        fill_template(
+                            &tpl,
+                            &[
+                                ("t", format!("{:.2}", self.steam_value)),
+                                ("t_unit", self.steam_t_unit.clone()),
+                                ("e", e.to_string()),
+                            ],
+                        )
+                    }
+            },
+            SteamMode::Superheated => match steam::superheated_at(
+                convert_pressure_mode_gui(
+                    self.steam_value,
+                    &self.steam_p_unit,
                             self.steam_p_mode,
                             "bar",
                             conversion::PressureMode::Absolute,
                         ),
-                        PressureUnit::BarA,
-                        convert_temperature_gui(self.steam_temp_input, &self.steam_t_unit, "C"),
-                        TemperatureUnit::Celsius,
-                    ) {
-                        Ok(s) => {
-                            let p_out = convert_pressure_mode_gui(
-                                s.pressure_bar,
-                                "bar",
-                                conversion::PressureMode::Absolute,
-                                &self.steam_p_unit_out,
-                                self.steam_p_mode_out,
-                            );
-                            let t_out = convert_temperature_gui(s.temperature_c, "C", &self.steam_t_unit_out);
-                            format!(
-                                "P={:.2} {}, T={:.1} {}, h={:.1} kJ/kg",
-                                p_out,
-                                self.steam_p_unit_out,
-                                t_out,
-                                self.steam_t_unit_out,
-                                s.superheated_enthalpy_kj_per_kg.unwrap_or(0.0)
-                            )
-                        }
-                        Err(e) => format!(
-                            "오류(P={:.3} {}{}, T={:.1} {}): {e}",
-                            self.steam_value,
-                            self.steam_p_unit,
-                            if self.steam_p_mode == conversion::PressureMode::Gauge {
-                                "g"
-                            } else {
-                                "a"
-                            },
-                            self.steam_temp_input,
-                            self.steam_t_unit
-                        ),
-                    },
-                });
-            }
-            if let Some(res) = &self.steam_result {
-                ui.separator();
-                ui.label(res);
-                ui.label("Psat=포화압력, Tsat=포화온도, hs/vs/ss=포화증기, hf/vf/sf=포화수");
-            }
+                    PressureUnit::BarA,
+                    convert_temperature_gui(self.steam_temp_input, &self.steam_t_unit, "C"),
+                    TemperatureUnit::Celsius,
+            ) {
+                Ok(s) => {
+                        let p_out = convert_pressure_mode_gui(
+                            s.pressure_bar,
+                            "bar",
+                            conversion::PressureMode::Absolute,
+                            &self.steam_p_unit_out,
+                            self.steam_p_mode_out,
+                        );
+                        let t_out = convert_temperature_gui(s.temperature_c, "C", &self.steam_t_unit_out);
+                        let tpl = txt(
+                            "gui.steam.result.superheat",
+                            "P={p} {p_unit}, T={t} {t_unit}, h={h} kJ/kg",
+                        );
+                        fill_template(
+                            &tpl,
+                            &[
+                                ("p", format!("{:.2}", p_out)),
+                                ("p_unit", self.steam_p_unit_out.clone()),
+                                ("t", format!("{:.1}", t_out)),
+                                ("t_unit", self.steam_t_unit_out.clone()),
+                                (
+                                    "h",
+                                    format!("{:.1}", s.superheated_enthalpy_kj_per_kg.unwrap_or(0.0)),
+                                ),
+                            ],
+                        )
+                    }
+                    Err(e) => {
+                        let tpl = txt(
+                            "gui.steam.error.superheat",
+                            "Error(P={p} {p_unit}{mode}, T={t} {t_unit}): {e}",
+                        );
+                        let mode = if self.steam_p_mode == conversion::PressureMode::Gauge {
+                            "g"
+                        } else {
+                            "a"
+                        };
+                        fill_template(
+                            &tpl,
+                            &[
+                                ("p", format!("{:.3}", self.steam_value)),
+                                ("p_unit", self.steam_p_unit.clone()),
+                                ("mode", mode.to_string()),
+                                ("t", format!("{:.1}", self.steam_temp_input)),
+                                ("t_unit", self.steam_t_unit.clone()),
+                                ("e", e.to_string()),
+                            ],
+                        )
+                    }
+            },
         });
+    }
+    if let Some(res) = &self.steam_result {
+        ui.separator();
+        ui.label(res);
+        legend_toggle(
+            ui,
+            &txt("legend.steam.title", "Legend / notes"),
+            &txt(
+                "legend.steam.body",
+                "Psat=sat pressure, Tsat=sat temperature, hs/vs/ss=sat vapor, hf/vf/sf=sat liquid",
+            ),
+            &mut self.show_legend_steam,
+        );
+    }
+});
     }
 
     fn ui_steam_piping(&mut self, ui: &mut egui::Ui) {
-        heading_with_tip(ui, "Steam Piping", "증기 배관 내경/유속/압력강하를 계산하는 도구");
+        let tr = self.tr.clone();
+        let txt = move |key: &str, default: &str| {
+            tr.lookup(key).unwrap_or_else(|| default.to_string())
+        };
+        heading_with_tip(
+            ui,
+            &txt("gui.pipe.heading", "Steam Piping"),
+            &txt(
+                "gui.pipe.tip",
+                "Pipe sizing and pressure-drop calculator for steam/gas.",
+            ),
+        );
         label_with_tip(
             ui,
-            "Pipe sizing 카드형 UI",
-            "질량유량·압력·온도·허용 유속을 입력해 적정 내경/유속/레이놀즈수를 제안합니다.",
+            &txt("gui.pipe.card_label", "Pipe sizing card"),
+            &txt(
+                "gui.pipe.card_tip",
+                "Enter mass flow, pressure/temperature, and target velocity to size ID and Reynolds.",
+            ),
         );
         ui.add_space(8.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1169,7 +1528,11 @@ impl GuiApp {
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    label_with_tip(ui, "질량 유량", "통과하는 증기 질량유량(kg/h 등)");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.pipe.mass_flow", "Mass flow"),
+                        &txt("gui.pipe.mass_flow_tip", "Steam/gas mass flow (kg/h etc.)"),
+                    );
                     ui.add(egui::DragValue::new(&mut self.pipe_mass_flow).speed(10.0));
                     unit_combo(
                         ui,
@@ -1182,7 +1545,14 @@ impl GuiApp {
                         ],
                     );
                     ui.end_row();
-                    label_with_tip(ui, "압력 [bar]", "배관 조건 압력 (게이지/절대 선택)");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.pipe.pressure", "Pressure [bar]"),
+                        &txt(
+                            "gui.pipe.pressure_tip",
+                            "Operating pressure (select gauge/absolute).",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.pipe_pressure).speed(0.1));
                     unit_combo(ui, &mut self.pipe_pressure_unit, pressure_unit_options());
                     ui.selectable_value(
@@ -1196,14 +1566,24 @@ impl GuiApp {
                         "Absolute (A)",
                     );
                     ui.end_row();
-                    label_with_tip(ui, "온도 [°C]", "배관 조건의 증기 온도");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.pipe.temperature", "Temperature [°C]"),
+                        &txt(
+                            "gui.pipe.temperature_tip",
+                            "Operating steam temperature.",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.pipe_temp).speed(1.0));
                     unit_combo(ui, &mut self.pipe_temp_unit, temperature_unit_options());
                     ui.end_row();
                     label_with_tip(
                         ui,
-                        "허용 유속 [m/s]",
-                        "설계 목표 유속(높이면 배관이 작아지나 소음/침식 위험 증가)",
+                        &txt("gui.pipe.velocity", "Target velocity [m/s]"),
+                        &txt(
+                            "gui.pipe.velocity_tip",
+                            "Design target velocity (higher → smaller ID but more noise/erosion).",
+                        ),
                     );
                     ui.add(egui::DragValue::new(&mut self.pipe_velocity).speed(1.0));
                     unit_combo(
@@ -1213,9 +1593,12 @@ impl GuiApp {
                     );
                     ui.end_row();
                 });
-            ui.small("Tip: mmHg는 게이지 기준(0=대기, -760mmHg=완전진공)으로 처리됩니다.");
+            ui.small(txt(
+                "gui.pipe.tip_mmhg",
+                "Tip: mmHg is treated as gauge (0=atm, -760mmHg=vacuum).",
+            ));
             ui.add_space(8.0);
-            if ui.button("사이징 계산").clicked() {
+            if ui.button(txt("gui.pipe.run_sizing", "Run sizing")).clicked() {
                 let density = steam::estimate_density(
                     convert_pressure_mode_gui(
                         self.pipe_pressure,
@@ -1259,36 +1642,60 @@ impl GuiApp {
                             r.reynolds_number
                         )
                     }
-                    Err(e) => format!(
-                        "오류(ṁ={:.2} {}, P={:.2} {}{}, T={:.1} {}): {e}",
-                        self.pipe_mass_flow,
-                        self.pipe_mass_unit,
-                        self.pipe_pressure,
-                        self.pipe_pressure_unit,
-                        if self.pipe_pressure_mode == conversion::PressureMode::Gauge {
+                    Err(e) => {
+                        let tpl = txt(
+                            "gui.pipe.error.sizing",
+                            "Error(mdot={mdot} {m_unit}, P={p} {p_unit}{mode}, T={t} {t_unit}): {e}",
+                        );
+                        let mode = if self.pipe_pressure_mode == conversion::PressureMode::Gauge {
                             "g"
                         } else {
                             "a"
-                        },
-                        self.pipe_temp,
-                        self.pipe_temp_unit
-                    ),
+                        };
+                        fill_template(
+                            &tpl,
+                            &[
+                                ("mdot", format!("{:.2}", self.pipe_mass_flow)),
+                                ("m_unit", self.pipe_mass_unit.clone()),
+                                ("p", format!("{:.2}", self.pipe_pressure)),
+                                ("p_unit", self.pipe_pressure_unit.clone()),
+                                ("mode", mode.to_string()),
+                                ("t", format!("{:.1}", self.pipe_temp)),
+                                ("t_unit", self.pipe_temp_unit.clone()),
+                                ("e", e.to_string()),
+                            ],
+                        )
+                    }
                 });
             }
             if let Some(res) = &self.pipe_result {
                 ui.separator();
                 ui.label(res);
-                ui.label("ID=내경, Velocity=유속, Re=레이놀즈수");
+                legend_toggle(
+                    ui,
+                    &txt("legend.pipe.title", "Legend / notes"),
+                    &txt(
+                        "legend.pipe.body",
+                        "ID=inner diameter, Velocity=flow velocity, Re=Reynolds number",
+                    ),
+                    &mut self.show_legend_pipe,
+                );
             }
         });
         ui.add_space(6.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label("Pressure Loss (Darcy-Weisbach)");
+            ui.label(txt(
+                "gui.pipe.loss.heading",
+                "Pressure Loss (Darcy-Weisbach)",
+            ));
             egui::Grid::new("pipe_loss_grid")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("질량 유량 [kg/h]");
+                    ui.label(txt(
+                        "gui.pipe.loss.mass_flow",
+                        "Mass flow [kg/h]",
+                    ));
                     ui.add(egui::DragValue::new(&mut self.pipe_mass_flow).speed(10.0));
                     unit_combo(
                         ui,
@@ -1296,31 +1703,46 @@ impl GuiApp {
                         &[("kg/h", "kg/h"), ("lb/h", "lb/h")],
                     );
                     ui.end_row();
-                    ui.label("밀도 [kg/m3]");
+                    ui.label(txt(
+                        "gui.pipe.loss.pressure",
+                        "State pressure [bar(a)] (IF97)",
+                    ));
+                    ui.add(egui::DragValue::new(&mut self.pipe_loss_pressure_bar_abs).speed(0.1));
+                    ui.end_row();
+                    ui.label(txt(
+                        "gui.pipe.loss.temperature",
+                        "State temperature [°C] (IF97)",
+                    ));
+                    ui.add(egui::DragValue::new(&mut self.pipe_loss_temperature_c).speed(1.0));
+                    ui.end_row();
+                    ui.label(txt("gui.pipe.loss.density", "Density [kg/m3]"));
                     ui.add(egui::DragValue::new(&mut self.pipe_loss_density).speed(0.1));
                     ui.end_row();
-                    ui.label("내경 [m]");
+                    ui.label(txt("gui.pipe.loss.diameter", "Inner diameter [m]"));
                     ui.add(egui::DragValue::new(&mut self.pipe_loss_diameter).speed(0.001));
                     ui.end_row();
-                    ui.label("길이 [m]");
+                    ui.label(txt("gui.pipe.loss.length", "Length [m]"));
                     ui.add(egui::DragValue::new(&mut self.pipe_loss_length).speed(1.0));
                     ui.end_row();
-                    ui.label("등가 길이 [m]");
+                    ui.label(txt("gui.pipe.loss.eq_length", "Equivalent length [m]"));
                     ui.add(egui::DragValue::new(&mut self.pipe_loss_eq_length).speed(1.0));
                     ui.end_row();
-                    ui.label("피팅 K 합");
+                    ui.label(txt("gui.pipe.loss.fittings", "Fittings K sum"));
                     ui.add(egui::DragValue::new(&mut self.pipe_loss_fittings_k).speed(0.1));
                     ui.end_row();
-                    ui.label("거칠기 ε [m]");
+                    ui.label(txt("gui.pipe.loss.roughness", "Roughness ε [m]"));
                     ui.add(egui::DragValue::new(&mut self.pipe_loss_roughness).speed(0.00001));
                     ui.end_row();
-                    ui.label("점도 [Pa·s]");
+                    ui.label(txt("gui.pipe.loss.viscosity", "Viscosity [Pa·s]"));
                     ui.add(egui::DragValue::new(&mut self.pipe_loss_visc).speed(1e-6));
                     ui.end_row();
-                    ui.label("음속 [m/s]");
+                    ui.label(txt("gui.pipe.loss.sound_speed", "Speed of sound [m/s]"));
                     ui.add(egui::DragValue::new(&mut self.pipe_loss_sound_speed).speed(5.0));
                     ui.end_row();
-                    ui.label("출력 ΔP 단위");
+                    ui.label(txt(
+                        "gui.pipe.loss.output",
+                        "Output ΔP unit",
+                    ));
                     unit_combo(ui, &mut self.pipe_loss_dp_out_unit, pressure_unit_options());
                     ui.selectable_value(
                         &mut self.pipe_loss_dp_out_mode,
@@ -1334,7 +1756,7 @@ impl GuiApp {
                     );
                     ui.end_row();
                 });
-            if ui.button("압력손실 계산").clicked() {
+            if ui.button(txt("gui.pipe.loss.run", "Calculate ΔP")).clicked() {
                 let input = steam::steam_piping::PressureLossInput {
                     mass_flow_kg_per_h: convert_massflow_gui(
                         self.pipe_mass_flow,
@@ -1349,6 +1771,8 @@ impl GuiApp {
                     roughness_m: self.pipe_loss_roughness,
                     dynamic_viscosity_pa_s: self.pipe_loss_visc,
                     sound_speed_m_per_s: self.pipe_loss_sound_speed,
+                    state_pressure_bar_abs: Some(self.pipe_loss_pressure_bar_abs),
+                    state_temperature_c: Some(self.pipe_loss_temperature_c),
                 };
                 self.pipe_loss_result = Some(match steam::steam_piping::pressure_loss(input) {
                     Ok(r) => {
@@ -1369,34 +1793,80 @@ impl GuiApp {
                             r.mach
                         )
                     }
-                    Err(e) => format!(
-                        "오류(ṁ={:.2} {}, ρ={:.2} kg/m3, D={:.4} m, L={:.1} m): {e}",
-                        self.pipe_mass_flow,
-                        self.pipe_mass_unit,
-                        self.pipe_loss_density,
-                        self.pipe_loss_diameter,
-                        self.pipe_loss_length
-                    ),
+                    Err(e) => {
+                        let tpl = txt(
+                            "gui.pipe.loss.error",
+                            "Error(mdot={mdot} {m_unit}, rho={rho} kg/m3, D={d} m, L={l} m): {e}",
+                        );
+                        fill_template(
+                            &tpl,
+                            &[
+                                ("mdot", format!("{:.2}", self.pipe_mass_flow)),
+                                ("m_unit", self.pipe_mass_unit.clone()),
+                                ("rho", format!("{:.2}", self.pipe_loss_density)),
+                                ("d", format!("{:.4}", self.pipe_loss_diameter)),
+                                ("l", format!("{:.1}", self.pipe_loss_length)),
+                                ("e", e.to_string()),
+                            ],
+                        )
+                    }
                 });
             }
             if let Some(res) = &self.pipe_loss_result {
                 ui.separator();
                 ui.label(res);
-                ui.label("ΔP=압력강하, v=유속, Re=레이놀즈수, f=마찰계수, Mach=음속비");
+                legend_toggle(
+                    ui,
+                    &txt("legend.pipe_loss.title", "Legend / notes"),
+                    &txt("legend.pipe_loss.body", "ΔP=pressure drop, v=velocity, Re=Reynolds, f=friction factor, Mach=speed ratio"),
+                    &mut self.show_legend_pipe_loss,
+                );
             }
         });
     }
 
     fn ui_steam_valves(&mut self, ui: &mut egui::Ui) {
-        heading_with_tip(ui, "Steam Valves & Orifices", "Cv/Kv 산정 또는 주어진 Cv/Kv로 유량 계산");
-        label_with_tip(ui, "Cv/Kv 계산 UI", "차압·상류압·유량·밀도 등을 입력하여 밸브 성능을 확인");
+        let tr = self.tr.clone();
+        let txt = move |key: &str, default: &str| {
+            tr.lookup(key).unwrap_or_else(|| default.to_string())
+        };
+        heading_with_tip(
+            ui,
+            &txt("gui.valve.heading", "Steam Valves & Orifices"),
+            &txt(
+                "gui.valve.tip",
+                "Compute required Cv/Kv or flow for given Cv/Kv.",
+            ),
+        );
+        label_with_tip(
+            ui,
+            &txt("gui.valve.card_label", "Cv/Kv calculator"),
+            &txt(
+                "gui.valve.card_tip",
+                "Use ΔP/upstream P/flow/density to size or check flow.",
+            ),
+        );
         ui.add_space(8.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.valve_mode, ValveMode::RequiredCvKv, "필요 Cv/Kv")
-                    .on_hover_text("목표 유량을 내기 위한 Cv/Kv 산정");
-                ui.selectable_value(&mut self.valve_mode, ValveMode::FlowFromCvKv, "Cv/Kv로 유량")
-                    .on_hover_text("Cv/Kv가 주어졌을 때 통과 유량 계산");
+                ui.selectable_value(
+                    &mut self.valve_mode,
+                    ValveMode::RequiredCvKv,
+                    txt("gui.valve.mode.required", "Required Cv/Kv"),
+                )
+                .on_hover_text(txt(
+                    "gui.valve.mode.required_tip",
+                    "Compute Cv/Kv to achieve the target flow.",
+                ));
+                ui.selectable_value(
+                    &mut self.valve_mode,
+                    ValveMode::FlowFromCvKv,
+                    txt("gui.valve.mode.flow", "Flow from Cv/Kv"),
+                )
+                .on_hover_text(txt(
+                    "gui.valve.mode.flow_tip",
+                    "Compute flow when Cv/Kv is given.",
+                ));
             });
             egui::Grid::new("valve_grid")
                 .num_columns(2)
@@ -1404,11 +1874,18 @@ impl GuiApp {
                 .show(ui, |ui| {
                     label_with_tip(
                         ui,
-                        match self.valve_mode {
-                            ValveMode::RequiredCvKv => "볼류메트릭 유량",
-                            ValveMode::FlowFromCvKv => "Cv/Kv 입력",
+                        &match self.valve_mode {
+                            ValveMode::RequiredCvKv => {
+                                txt("gui.valve.input.flow", "Volumetric flow")
+                            }
+                            ValveMode::FlowFromCvKv => {
+                                txt("gui.valve.input.cv", "Cv/Kv input")
+                            }
                         },
-                        "유량을 입력하거나 Cv/Kv를 입력",
+                        &txt(
+                            "gui.valve.input.flow_tip",
+                            "Enter flow to size Cv/Kv, or enter Cv/Kv to compute flow.",
+                        ),
                     );
                     ui.add(egui::DragValue::new(&mut self.valve_flow).speed(1.0));
                     if matches!(self.valve_mode, ValveMode::RequiredCvKv) {
@@ -1428,8 +1905,11 @@ impl GuiApp {
                     ui.end_row();
                     label_with_tip(
                         ui,
-                        "차압 [bar]",
-                        "밸브 양단의 압력차 ΔP (게이지/절대 선택) — 증기/가스는 초크 여부 확인",
+                        &txt("gui.valve.input.dp", "ΔP [bar]"),
+                        &txt(
+                            "gui.valve.input.dp_tip",
+                            "Pressure drop across valve (choose gauge/absolute); check choking for steam/gas.",
+                        ),
                     );
                     ui.add(egui::DragValue::new(&mut self.valve_dp).speed(0.1));
                     unit_combo(ui, &mut self.valve_dp_unit, pressure_unit_options());
@@ -1438,8 +1918,11 @@ impl GuiApp {
                     ui.end_row();
                     label_with_tip(
                         ui,
-                        "상류 압력",
-                        "Cv/Kv로 유량 계산 시 상류 절대압 입력 (초크 판정용)",
+                        &txt("gui.valve.input.upstream", "Upstream pressure"),
+                        &txt(
+                            "gui.valve.input.upstream_tip",
+                            "Absolute upstream pressure when computing flow (for choking check).",
+                        ),
                     );
                     ui.add(egui::DragValue::new(&mut self.valve_upstream_p).speed(0.1));
                     unit_combo(ui, &mut self.valve_upstream_unit, pressure_unit_options());
@@ -1448,21 +1931,31 @@ impl GuiApp {
                     ui.end_row();
                     label_with_tip(
                         ui,
-                        "밀도 [kg/m3]",
-                        "유체 밀도(증기/가스면 조건에 맞춰 입력, 증기면 IF97 결과 사용 권장)",
+                        &txt("gui.valve.input.density", "Density [kg/m3]"),
+                        &txt(
+                            "gui.valve.input.density_tip",
+                            "Fluid density (use condition-based density; IF97 recommended for steam).",
+                        ),
                     );
                     ui.add(egui::DragValue::new(&mut self.valve_rho).speed(0.1));
                     unit_combo(ui, &mut self.valve_rho_unit, &[("kg/m3", "kg/m3"), ("lb/ft3", "lb/ft3")]);
                     ui.end_row();
                     if let ValveMode::FlowFromCvKv = self.valve_mode {
-                        label_with_tip(ui, "Cv/Kv 값", "제조사 제공 Cv 또는 Kv");
+                        label_with_tip(
+                            ui,
+                            &txt("gui.valve.input.cv_value", "Cv/Kv value"),
+                            &txt("gui.valve.input.cv_tip", "Manufacturer Cv or Kv value"),
+                        );
                         ui.add(egui::DragValue::new(&mut self.valve_cv_kv).speed(0.5));
                         ui.end_row();
                     }
                 });
-            ui.small("Tip: mmHg는 게이지 기준(0=대기, -760mmHg=완전진공)으로 처리됩니다.");
+            ui.small(txt(
+                "gui.valve.tip_mmhg",
+                "Tip: mmHg is treated as gauge (0=atm, -760mmHg=vacuum).",
+            ));
             ui.add_space(8.0);
-            if ui.button("계산").clicked() {
+            if ui.button(txt("gui.valve.run", "Calculate")).clicked() {
                 self.valve_result = Some(match self.valve_mode {
                     ValveMode::RequiredCvKv => match steam_valves::required_kv(
                         convert_flow_gui(self.valve_flow, &self.valve_flow_unit, &self.valve_rho_unit, self.valve_rho),
@@ -1475,21 +1968,40 @@ impl GuiApp {
                         ),
                         convert_density_gui(self.valve_rho, &self.valve_rho_unit, "kg/m3"),
                     ) {
-                        Ok(kv) => format!("Kv={:.3}, Cv={:.3}", kv, steam_valves::cv_from_kv(kv)),
-                        Err(e) => format!(
-                            "오류(Q={:.2} {}, ΔP={:.2} {}{}, ρ={:.2} {}): {e}",
-                            self.valve_flow,
-                            self.valve_flow_unit,
-                            self.valve_dp,
-                            self.valve_dp_unit,
-                            if self.valve_dp_mode == conversion::PressureMode::Gauge {
+                        Ok(kv) => {
+                            let tpl = txt("gui.valve.result.required", "Kv={kv}, Cv={cv}");
+                            fill_template(
+                                &tpl,
+                                &[
+                                    ("kv", format!("{:.3}", kv)),
+                                    ("cv", format!("{:.3}", steam_valves::cv_from_kv(kv))),
+                                ],
+                            )
+                        }
+                        Err(e) => {
+                            let tpl = txt(
+                                "gui.valve.error.required",
+                                "Error(Q={q} {q_unit}, ΔP={dp} {dp_unit}{mode}, rho={rho} {rho_unit}): {e}",
+                            );
+                            let mode = if self.valve_dp_mode == conversion::PressureMode::Gauge {
                                 "g"
                             } else {
                                 "a"
-                            },
-                            self.valve_rho,
-                            self.valve_rho_unit
-                        ),
+                            };
+                            fill_template(
+                                &tpl,
+                                &[
+                                    ("q", format!("{:.2}", self.valve_flow)),
+                                    ("q_unit", self.valve_flow_unit.clone()),
+                                    ("dp", format!("{:.2}", self.valve_dp)),
+                                    ("dp_unit", self.valve_dp_unit.clone()),
+                                    ("mode", mode.to_string()),
+                                    ("rho", format!("{:.2}", self.valve_rho)),
+                                    ("rho_unit", self.valve_rho_unit.clone()),
+                                    ("e", e.to_string()),
+                                ],
+                            )
+                        }
                     },
                     ValveMode::FlowFromCvKv => {
                         let upstream_bar_abs = convert_pressure_mode_gui(
@@ -1536,32 +2048,49 @@ impl GuiApp {
                                     false
                                 };
                                 let warn = if choked {
-                                    " [주의: 음속 임계(Choked) 가능]"
+                                    txt("gui.valve.warn.choked", " [Warning: potential choked flow]").to_string()
                                 } else {
-                                    ""
+                                    String::new()
                                 };
-                                format!(
-                                    "유량 {:.3} {}{warn}, 질량 {:.3} kg/h (Pu={:.2} bar(a), Pd={:.2} bar(a))",
-                                    q_out,
-                                    self.valve_flow_unit,
-                                    mass_kg_h,
-                                    upstream_bar_abs,
-                                    downstream_abs
+                                let tpl = txt(
+                                    "gui.valve.result.flow",
+                                    "Flow {flow} {flow_unit}{warn}, mass {mass} kg/h (Pu={pu} bar(a), Pd={pd} bar(a))",
+                                );
+                                fill_template(
+                                    &tpl,
+                                    &[
+                                        ("flow", format!("{:.3}", q_out)),
+                                        ("flow_unit", self.valve_flow_unit.clone()),
+                                        ("warn", warn),
+                                        ("mass", format!("{:.3}", mass_kg_h)),
+                                        ("pu", format!("{:.2}", upstream_bar_abs)),
+                                        ("pd", format!("{:.2}", downstream_abs)),
+                                    ],
                                 )
                             }
-                            Err(e) => format!(
-                                "오류(Cv/Kv={:.2}, ΔP={:.2} {}{}, ρ={:.2} {}): {e}",
-                                kv,
-                                self.valve_dp,
-                                self.valve_dp_unit,
-                                if self.valve_dp_mode == conversion::PressureMode::Gauge {
+                            Err(e) => {
+                                let tpl = txt(
+                                    "gui.valve.error.flow",
+                                    "Error(Cv/Kv={cv}, ΔP={dp} {dp_unit}{mode}, rho={rho} {rho_unit}): {e}",
+                                );
+                                let mode = if self.valve_dp_mode == conversion::PressureMode::Gauge {
                                     "g"
                                 } else {
                                     "a"
-                                },
-                                self.valve_rho,
-                                self.valve_rho_unit
-                            ),
+                                };
+                                fill_template(
+                                    &tpl,
+                                    &[
+                                        ("cv", format!("{:.2}", kv)),
+                                        ("dp", format!("{:.2}", self.valve_dp)),
+                                        ("dp_unit", self.valve_dp_unit.clone()),
+                                        ("mode", mode.to_string()),
+                                        ("rho", format!("{:.2}", self.valve_rho)),
+                                        ("rho_unit", self.valve_rho_unit.clone()),
+                                        ("e", e.to_string()),
+                                    ],
+                                )
+                            }
                         }
                     }
                 });
@@ -1569,7 +2098,12 @@ impl GuiApp {
             if let Some(res) = &self.valve_result {
                 ui.separator();
                 ui.label(res);
-                ui.label("Cv/Kv: 유량 계수, ΔP: 차압, 밀도/임계 유량 여부에 유의");
+                legend_toggle(
+                    ui,
+                    &txt("legend.valve.title", "Legend / notes"),
+                    &txt("legend.valve.body", "Cv/Kv: flow coefficient, ΔP: pressure drop; note density and choking limits."),
+                    &mut self.show_legend_valve,
+                );
             }
         });
         ui.add_space(10.0);
@@ -1580,18 +2114,28 @@ impl GuiApp {
     /// - Bypass Valve(증기): Cv/Kv 혹은 Stroke-Cv 테이블로 증기 유량을 계산하고, 필요 시 TCV(물) 결과를 합산해 엔탈피를 본다.
     /// - TCV(물): 별도 물 밸브 유량 계산을 제공하며, 결과가 바이패스 스프레이 값으로 자동 반영된다.
     fn ui_bypass_panels(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Bypass Valve(증기) / TCV(물)");
-        ui.label("Stroke별 Cv 테이블이 있으면 보간, 없으면 Cv/Kv 단일 값 사용");
+        let tr = self.tr.clone();
+        let txt = move |key: &str, default: &str| {
+            tr.lookup(key).unwrap_or_else(|| default.to_string())
+        };
+        ui.heading(txt(
+            "gui.bypass.heading",
+            "Bypass Valve (steam) / TCV (water)",
+        ));
+        ui.label(txt(
+            "gui.bypass.tip",
+            "Use stroke-Cv table if available, otherwise single Cv/Kv.",
+        ));
         ui.add_space(6.0);
 
         // ---------- ST Bypass Valve (증기) ----------
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.heading("Bypass Valve (증기)");
+            ui.heading(txt("gui.bypass.steam.heading", "Bypass Valve (steam)"));
             egui::Grid::new("bypass_grid")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("상류 압력");
+                    ui.label(txt("gui.bypass.steam.up_p", "Upstream pressure"));
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut self.bypass_up_p).speed(0.5));
                         unit_combo(ui, &mut self.bypass_up_unit, pressure_unit_options());
@@ -1608,14 +2152,14 @@ impl GuiApp {
                     });
                     ui.end_row();
 
-                    ui.label("상류 온도");
+                    ui.label(txt("gui.bypass.steam.up_t", "Upstream temperature"));
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut self.bypass_up_t).speed(1.0));
                         unit_combo(ui, &mut self.bypass_t_unit, temperature_unit_options());
                     });
                     ui.end_row();
 
-                    ui.label("하류 압력");
+                    ui.label(txt("gui.bypass.steam.down_p", "Downstream pressure"));
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut self.bypass_down_p).speed(0.5));
                         unit_combo(ui, &mut self.bypass_down_unit, pressure_unit_options());
@@ -1632,7 +2176,7 @@ impl GuiApp {
                     });
                     ui.end_row();
 
-                    ui.label("Cv/Kv");
+                    ui.label(txt("gui.bypass.steam.cv", "Cv/Kv"));
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut self.bypass_cv).speed(1.0));
                         egui::ComboBox::from_id_source("bypass_cv_kind")
@@ -1642,7 +2186,7 @@ impl GuiApp {
                                 ui.selectable_value(&mut self.bypass_cv_kind, "Cv(UK)".into(), "Cv(UK)");
                                 ui.selectable_value(&mut self.bypass_cv_kind, "Kv".into(), "Kv");
                             });
-                        ui.label("개도(%)");
+                        ui.label(txt("gui.bypass.steam.stroke", "Stroke (%)"));
                         ui.add(
                             egui::DragValue::new(&mut self.bypass_open_pct)
                                 .speed(1.0)
@@ -1650,7 +2194,10 @@ impl GuiApp {
                         );
                     });
                     ui.end_row();
-                    ui.label("증기 엔탈피 입력(kJ/kg, 0=자동 IF97)");
+                    ui.label(txt(
+                        "gui.bypass.steam.h_override",
+                        "Steam enthalpy input (kJ/kg, 0=auto IF97)",
+                    ));
                     ui.add(egui::DragValue::new(&mut self.bypass_h_override_kj_per_kg).speed(10.0));
                     ui.end_row();
                     if stroke_based_kv_available(&self.bypass_stroke_points, &self.bypass_cv_points) {
@@ -1659,12 +2206,27 @@ impl GuiApp {
                             &self.bypass_cv_points,
                             self.bypass_open_pct,
                         );
-                        ui.label(format!("보간 Cv/Kv~{:.3} (개도 {:.1}%)", cv_interp, self.bypass_open_pct));
+                        ui.label(format!(
+                            "{}",
+                            fill_template(
+                                &txt(
+                                    "gui.bypass.steam.cv_interp",
+                                    "Interpolated Cv/Kv≈{cv:.3} (stroke {stroke:.1}%)",
+                                ),
+                                &[
+                                    ("cv", format!("{:.3}", cv_interp)),
+                                    ("stroke", format!("{:.1}", self.bypass_open_pct)),
+                                ],
+                            )
+                        ));
                         ui.end_row();
                     }
                 });
 
-            ui.label("Stroke-Cv/Kv 테이블(바이패스)");
+            ui.label(txt(
+                "gui.bypass.steam.table",
+                "Stroke-Cv/Kv table (bypass)",
+            ));
             let bypass_suffix = if self
                 .bypass_cv_kind
                 .to_lowercase()
@@ -1695,11 +2257,17 @@ impl GuiApp {
                 });
             }
             ui.horizontal(|ui| {
-                if ui.small_button("+ 행 추가").clicked() {
+                if ui
+                    .small_button(txt("gui.bypass.table.add_row", "+ Add row"))
+                    .clicked()
+                {
                     self.bypass_stroke_points.push(100.0);
                     self.bypass_cv_points.push(0.0);
                 }
-                ui.label("보간: 개도%에 해당 Cv 사용");
+                ui.label(txt(
+                    "gui.bypass.table.note",
+                    "Interpolation uses Cv for the matching stroke percent.",
+                ));
             });
             if let Some(idx) = remove_idx {
                 if self.bypass_stroke_points.len() > 1 {
@@ -1709,7 +2277,10 @@ impl GuiApp {
             }
 
             ui.add_space(6.0);
-            if ui.button("Bypass 계산").clicked() {
+            if ui
+                .button(txt("gui.bypass.run", "Calculate bypass"))
+                .clicked()
+            {
                 let up_abs = convert_pressure_mode_gui(
                     self.bypass_up_p,
                     &self.bypass_up_unit,
@@ -1740,7 +2311,7 @@ impl GuiApp {
                 };
 
                 self.bypass_result = if dp <= 0.0 {
-                    Some("오류: ΔP가 0 이하입니다.".into())
+                    Some(txt("gui.bypass.error.dp_nonpos", "Error: ΔP must be > 0").to_string())
                 } else {
                     // 증기 밀도/엔탈피 계산
                     let props = steam::if97::region_props(up_abs, t_c);
@@ -1780,29 +2351,49 @@ impl GuiApp {
                                         false
                                     };
                                     let warn = if choked {
-                                        " [주의: 임계(Choked) 가능]"
+                                        txt(
+                                            "gui.bypass.steam.warn.choked",
+                                            " [Warning: potential choked flow]",
+                                        )
                                     } else {
-                                        ""
+                                        String::new()
                                     };
-                                    Some(format!(
-                                        "증기 Q={:.3} m³/h, m={:.2} kg/h{warn}; 스프레이={:.1} kg/h → 혼합 엔탈피~{:.1} kJ/kg, 총 열량~{:.1} kW (Pu={:.2} bar(a), Pd={:.2} bar(a), Kv={:.2})",
-                                        q_m3h,
-                                        m_steam,
-                                        m_spray,
-                                        h_mix / 1000.0,
-                                        total_heat_kw,
-                                        up_abs,
-                                        down_abs,
-                                        kv
+                                    Some(fill_template(
+                                        &txt(
+                                            "gui.bypass.steam.result",
+                                            "Steam Q={q:.3} m³/h, m={m:.2} kg/h{warn}; spray={spray:.1} kg/h → mixed h≈{h_mix:.1} kJ/kg, total heat≈{heat:.1} kW (Pu={pu:.2} bar(a), Pd={pd:.2} bar(a), Kv={kv:.2})",
+                                        ),
+                                        &[
+                                            ("q", format!("{:.3}", q_m3h)),
+                                            ("m", format!("{:.2}", m_steam)),
+                                            ("spray", format!("{:.1}", m_spray)),
+                                            ("h_mix", format!("{:.1}", h_mix / 1000.0)),
+                                            ("heat", format!("{:.1}", total_heat_kw)),
+                                            ("pu", format!("{:.2}", up_abs)),
+                                            ("pd", format!("{:.2}", down_abs)),
+                                            ("kv", format!("{:.2}", kv)),
+                                            ("warn", warn),
+                                        ],
                                     ))
                                 }
-                                Err(e) => Some(format!(
-                                    "오류(Kv={:.2}, ΔP={:.2} bar, ρ={:.2} kg/m3): {e}",
-                                    kv, dp, rho
+                                Err(e) => Some(fill_template(
+                                    &txt(
+                                        "gui.bypass.steam.error.flow",
+                                        "Error(Kv={kv:.2}, ΔP={dp:.2} bar, ρ={rho:.2} kg/m3): {e}",
+                                    ),
+                                    &[
+                                        ("kv", format!("{:.2}", kv)),
+                                        ("dp", format!("{:.2}", dp)),
+                                        ("rho", format!("{:.2}", rho)),
+                                        ("e", e.to_string()),
+                                    ],
                                 )),
                             }
                         }
-                        Err(e) => Some(format!("IF97 계산 실패: {e}")),
+                        Err(e) => Some(fill_template(
+                            &txt("gui.bypass.steam.error.if97", "IF97 calculation failed: {e}"),
+                            &[("e", e.to_string())],
+                        )),
                     }
                 };
             }
@@ -1813,14 +2404,14 @@ impl GuiApp {
 
         ui.add_space(12.0);
 
-        // ---------- Bypass TCV (물) ----------
+        // ---------- {t_head} ----------
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.heading("Bypass TCV (물)");
+            ui.heading(txt("gui.bypass.water.heading", "Bypass TCV (water)"));
             egui::Grid::new("spray_grid")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("상류 압력");
+                    ui.label(txt("gui.bypass.water.up_p", "Upstream pressure"));
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut self.spray_up_p).speed(0.2));
                         unit_combo(ui, &mut self.spray_up_unit, pressure_unit_options());
@@ -1837,7 +2428,7 @@ impl GuiApp {
                     });
                     ui.end_row();
 
-                    ui.label("하류 압력");
+                    ui.label(txt("gui.bypass.water.down_p", "Downstream pressure"));
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut self.spray_down_p).speed(0.2));
                         unit_combo(ui, &mut self.spray_down_unit, pressure_unit_options());
@@ -1854,18 +2445,18 @@ impl GuiApp {
                     });
                     ui.end_row();
 
-                    ui.label("물 온도");
+                    ui.label(txt("gui.bypass.water.temp", "Water temperature"));
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut self.spray_temp).speed(0.5));
                         unit_combo(ui, &mut self.spray_temp_unit, temperature_unit_options());
                     });
                     ui.end_row();
 
-                    ui.label("밀도 [kg/m3]");
+                    ui.label(txt("gui.bypass.water.density", "Density [kg/m3]"));
                     ui.add(egui::DragValue::new(&mut self.spray_density).speed(1.0));
                     ui.end_row();
 
-                    ui.label("Cv/Kv");
+                    ui.label(txt("gui.bypass.steam.cv", "Cv/Kv"));
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut self.spray_cv).speed(1.0));
                         egui::ComboBox::from_id_source("spray_cv_kind")
@@ -1875,7 +2466,7 @@ impl GuiApp {
                                 ui.selectable_value(&mut self.spray_cv_kind, "Cv(UK)".into(), "Cv(UK)");
                                 ui.selectable_value(&mut self.spray_cv_kind, "Kv".into(), "Kv");
                             });
-                        ui.label("개도(%)");
+                        ui.label(txt("gui.bypass.water.stroke", "Stroke (%)"));
                         ui.add(
                             egui::DragValue::new(&mut self.spray_open_pct)
                                 .speed(1.0)
@@ -1883,7 +2474,7 @@ impl GuiApp {
                         );
                     });
                     ui.end_row();
-                    ui.label("물 엔탈피 입력(kJ/kg, 0=자동)");
+                    ui.label(txt("gui.bypass.water.h_override", "Water enthalpy input (kJ/kg, 0=auto)"));
                     ui.add(egui::DragValue::new(&mut self.spray_h_override_kj_per_kg).speed(10.0));
                     ui.end_row();
                     if stroke_based_kv_available(&self.spray_stroke_points, &self.spray_cv_points) {
@@ -1892,12 +2483,12 @@ impl GuiApp {
                             &self.spray_cv_points,
                             self.spray_open_pct,
                         );
-                        ui.label(format!("보간 Cv/Kv~{:.3} (개도 {:.1}%)", cv_interp, self.spray_open_pct));
+                        ui.label(fill_template(&txt("gui.bypass.water.cv_interp", "Interpolated Cv/Kv≈{cv:.3} (stroke {stroke:.1}%)"), &[("cv", format!("{:.3}", cv_interp)), ("stroke", format!("{:.1}", self.spray_open_pct))]));
                         ui.end_row();
                     }
                 });
 
-            ui.label("Stroke-Cv/Kv 테이블(빈 값은 무시, + / - 로 행 추가/삭제)");
+            ui.label(txt("gui.bypass.water.table", "Stroke-Cv/Kv table (water)"));
             let spray_suffix = if self.spray_cv_kind.to_lowercase().starts_with("kv") {
                 "Kv"
             } else {
@@ -1924,11 +2515,11 @@ impl GuiApp {
                 });
             }
             ui.horizontal(|ui| {
-                if ui.small_button("+ 행 추가").clicked() {
+                if ui.small_button(txt("gui.bypass.table.add_row", "+ Add row")).clicked() {
                     self.spray_stroke_points.push(100.0);
                     self.spray_cv_points.push(0.0);
                 }
-                ui.label("보간: 개도%에 해당 Cv 사용");
+                ui.label(txt("gui.bypass.water.tip_table", "Empty rows are ignored; use +/- to add/remove."));
             });
             if let Some(idx) = remove_idx {
                 if self.spray_stroke_points.len() > 1 {
@@ -1938,7 +2529,7 @@ impl GuiApp {
             }
 
             ui.add_space(6.0);
-            if ui.button("TCV 유량 계산").clicked() {
+            if ui.button(txt("gui.bypass.water.run", "Calculate TCV flow")).clicked() {
                 let up_abs = convert_pressure_mode_gui(
                     self.spray_up_p,
                     &self.spray_up_unit,
@@ -1965,7 +2556,13 @@ impl GuiApp {
                 }
                 let kv = kv_from_cv_with_kind(cv_use, &self.spray_cv_kind);
                 self.spray_calc_result = if dp <= 0.0 || rho <= 0.0 {
-                    Some("오류: ΔP와 밀도는 0보다 커야 합니다.".into())
+                    Some(
+                        txt(
+                            "gui.bypass.water.error.input",
+                            "Error: ΔP and density must be > 0",
+                        )
+                        .to_string(),
+                    )
                 } else {
                     match steam_valves::flow_from_kv(kv, dp, rho, Some(up_abs)) {
                         Ok(q_m3h) => {
@@ -1976,12 +2573,23 @@ impl GuiApp {
                                 &self.spray_temp_unit,
                                 &self.bypass_spray_temp_unit,
                             );
-                            Some(format!(
-                                "TCV 유량 Q={:.3} m³/h, m={:.2} kg/h (ΔP={:.2} bar, Kv={:.2}) - 바이패스 스프레이 입력에 반영됨",
-                                q_m3h, mass, dp, kv
+                            Some(fill_template(
+                                &txt(
+                                    "gui.bypass.water.result",
+                                    "TCV flow Q={q:.3} m³/h, m={m:.2} kg/h (ΔP={dp:.2} bar, Kv={kv:.2}) - used for bypass spray input",
+                                ),
+                                &[
+                                    ("q", format!("{:.3}", q_m3h)),
+                                    ("m", format!("{:.2}", mass)),
+                                    ("dp", format!("{:.2}", dp)),
+                                    ("kv", format!("{:.2}", kv)),
+                                ],
                             ))
                         }
-                        Err(e) => Some(format!("오류: {e}")),
+                        Err(e) => Some(fill_template(
+                            &txt("gui.bypass.water.error.generic", "Error: {e}"),
+                            &[("e", e.to_string())],
+                        )),
                     }
                 };
             }
@@ -1991,15 +2599,28 @@ impl GuiApp {
         });
     }
     fn ui_boiler(&mut self, ui: &mut egui::Ui) {
+        let tr = self.tr.clone();
+        let txt = move |key: &str, default: &str| {
+            tr.lookup(key).unwrap_or_else(|| default.to_string())
+        };
         heading_with_tip(
             ui,
-            "Boiler Efficiency",
-            "연료 투입량과 증기/급수 엔탈피로 보일러 기본 열효율(PTC) 계산",
+            &txt("gui.boiler.heading", "Boiler Efficiency"),
+            &txt(
+                "gui.boiler.tip",
+                "Compute basic boiler efficiency (PTC) from fuel input and steam/feedwater enthalpy.",
+            ),
         );
         label_with_tip(
             ui,
-            "연료 투입량과 증기/급수 엔탈피로 기본 열효율 계산",
-            "LHV, 증기 발생량, 급수 엔탈피, 손실 항목 등을 입력해 효율을 추산합니다.",
+            &txt(
+                "gui.boiler.subheading",
+                "Basic efficiency from fuel LHV, steam/feedwater enthalpy, losses.",
+            ),
+            &txt(
+                "gui.boiler.subhint",
+                "Enter LHV, steam/feedwater flows/enthalpy and losses to estimate efficiency.",
+            ),
         );
         ui.add_space(8.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -2007,7 +2628,14 @@ impl GuiApp {
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    label_with_tip(ui, "연료 소비량 [unit/h]", "연료 질량 또는 체적 유량 (kg/h, Nm3/h 등)");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.boiler.fuel_flow", "Fuel flow [unit/h]"),
+                        &txt(
+                            "gui.boiler.fuel_flow_tip",
+                            "Fuel mass or volume flow (kg/h, Nm3/h, etc.)",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.boiler_fuel_flow).speed(1.0));
                     unit_combo(
                         ui,
@@ -2021,7 +2649,11 @@ impl GuiApp {
                         ],
                     );
                     ui.end_row();
-                    label_with_tip(ui, "연료 LHV [kJ/unit]", "저위발열량 (연료 단위당 발열량)");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.boiler.lhv", "Fuel LHV [kJ/unit]"),
+                        &txt("gui.boiler.lhv_tip", "Lower heating value per fuel unit"),
+                    );
                     ui.add(egui::DragValue::new(&mut self.boiler_lhv).speed(100.0));
                     unit_combo(
                         ui,
@@ -2034,7 +2666,11 @@ impl GuiApp {
                         ],
                     );
                     ui.end_row();
-                    label_with_tip(ui, "증기 발생량 [kg/h]", "보일러에서 생산되는 증기 질량유량");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.boiler.steam_flow", "Steam production [kg/h]"),
+                        &txt("gui.boiler.steam_flow_tip", "Produced steam mass flow"),
+                    );
                     ui.add(egui::DragValue::new(&mut self.boiler_steam_flow).speed(10.0));
                     unit_combo(
                         ui,
@@ -2047,24 +2683,46 @@ impl GuiApp {
                         ],
                     );
                     ui.end_row();
-                    label_with_tip(ui, "증기 엔탈피 [kJ/kg]", "생산 증기의 엔탈피 (IF97 결과를 입력해도 됨)");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.boiler.h_steam", "Steam enthalpy [kJ/kg]"),
+                        &txt(
+                            "gui.boiler.h_steam_tip",
+                            "Enthalpy of produced steam (IF97 result is fine)",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.boiler_h_steam).speed(10.0));
                     unit_combo(
                         ui,
                         &mut self.boiler_h_steam_unit,
-                        &[("kJ/kg", "kJ/kg"), ("kcal/kg", "kcal/kg"), ("Btu/lb", "Btu/lb")],
+                        &[
+                            ("kJ/kg", "kJ/kg"),
+                            ("kcal/kg", "kcal/kg"),
+                            ("Btu/lb", "Btu/lb"),
+                        ],
                     );
                     ui.end_row();
-                    label_with_tip(ui, "급수 엔탈피 [kJ/kg]", "급수(보급수) 엔탈피");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.boiler.h_fw", "Feedwater enthalpy [kJ/kg]"),
+                        &txt("gui.boiler.h_fw_tip", "Feedwater enthalpy"),
+                    );
                     ui.add(egui::DragValue::new(&mut self.boiler_h_fw).speed(5.0));
                     unit_combo(
                         ui,
                         &mut self.boiler_h_fw_unit,
-                        &[("kJ/kg", "kJ/kg"), ("kcal/kg", "kcal/kg"), ("Btu/lb", "Btu/lb")],
+                        &[
+                            ("kJ/kg", "kJ/kg"),
+                            ("kcal/kg", "kcal/kg"),
+                            ("Btu/lb", "Btu/lb"),
+                        ],
                     );
                     ui.end_row();
                 });
-            if ui.button("효율 계산").clicked() {
+            if ui
+                .button(txt("gui.boiler.run_basic", "Calculate efficiency"))
+                .clicked()
+            {
                 let input = steam::boiler_efficiency::BoilerEfficiencyInput {
                     fuel_flow_per_h: self.boiler_fuel_flow, // 단위 변환 필요 시 확장
                     fuel_lhv_kj_per_unit: convert_energy_gui(
@@ -2089,11 +2747,16 @@ impl GuiApp {
                     ),
                 };
                 let res = steam::boiler_efficiency::boiler_efficiency(input);
-                self.boiler_result = Some(format!(
-                    "효율={:.2} %, 유효열={:.1} kW, 연료열={:.1} kW",
-                    res.efficiency * 100.0,
-                    res.useful_heat_kw,
-                    res.fuel_heat_kw
+                self.boiler_result = Some(fill_template(
+                    &txt(
+                        "gui.boiler.result_basic",
+                        "Efficiency={eff:.2} %, Useful heat={useful:.1} kW, Fuel heat={fuel:.1} kW",
+                    ),
+                    &[
+                        ("eff", format!("{:.2}", res.efficiency * 100.0)),
+                        ("useful", format!("{:.1}", res.useful_heat_kw)),
+                        ("fuel", format!("{:.1}", res.fuel_heat_kw)),
+                    ],
                 ));
             }
             if let Some(res) = &self.boiler_result {
@@ -2104,15 +2767,25 @@ impl GuiApp {
         ui.add_space(10.0);
         heading_with_tip(
             ui,
-            "PTC 4.0 확장 (스택/복사/블로다운 손실 포함)",
-            "배가스 손실, 과잉공기, 블로다운을 포함한 확장 손실 계산",
+            &txt(
+                "gui.boiler.ptc.heading",
+                "PTC 4.0 extended (stack/radiation/blowdown losses)",
+            ),
+            &txt(
+                "gui.boiler.ptc.tip",
+                "Include flue gas losses, excess air, radiation and blowdown.",
+            ),
         );
         egui::Frame::group(ui.style()).show(ui, |ui| {
             egui::Grid::new("boiler_ptc_grid")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    label_with_tip(ui, "배가스 유량", "배기가스 질량유량");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.boiler.ptc.fg_flow", "Flue gas flow"),
+                        &txt("gui.boiler.ptc.fg_flow_tip", "Flue gas mass flow"),
+                    );
                     ui.add(egui::DragValue::new(&mut self.boiler_fg_flow).speed(10.0));
                     unit_combo(
                         ui,
@@ -2126,35 +2799,81 @@ impl GuiApp {
                     );
                     ui.end_row();
 
-                    label_with_tip(ui, "배가스 cp [kJ/kgK]", "배기가스 평균 비열 cp");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.boiler.ptc.fg_cp", "Flue gas cp [kJ/kgK]"),
+                        &txt("gui.boiler.ptc.fg_cp_tip", "Average flue gas cp"),
+                    );
                     ui.add(egui::DragValue::new(&mut self.boiler_fg_cp).speed(0.01));
                     ui.end_row();
 
-                    label_with_tip(ui, "굴뚝 온도", "스택(굴뚝) 배출 온도");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.boiler.ptc.stack_temp", "Stack temperature"),
+                        &txt(
+                            "gui.boiler.ptc.stack_temp_tip",
+                            "Stack/duct outlet temperature",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.boiler_stack_temp).speed(1.0));
                     unit_combo(ui, &mut self.boiler_temp_unit, temperature_unit_options());
                     ui.end_row();
 
-                    label_with_tip(ui, "주변 온도", "기준/연소 공기 온도");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.boiler.ptc.ambient_temp", "Ambient temperature"),
+                        &txt(
+                            "gui.boiler.ptc.ambient_temp_tip",
+                            "Reference/combustion air temperature",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.boiler_ambient_temp).speed(1.0));
                     unit_combo(ui, &mut self.boiler_temp_unit, temperature_unit_options());
                     ui.end_row();
 
-                    ui.small("Tip: mmHg는 게이지 기준(0=대기, -760mmHg=완전진공)으로 처리됩니다.");
+                    ui.small(txt(
+                "gui.valve.tip_mmhg",
+                "Tip: mmHg is treated as gauge (0=atm, -760mmHg=vacuum).",
+            ));
 
-                    label_with_tip(ui, "과잉 공기율", "이론 공기량 대비 실제 공기량 비율");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.boiler.ptc.excess_air", "Excess air ratio"),
+                        &txt(
+                            "gui.boiler.ptc.excess_air_tip",
+                            "Actual air vs theoretical air ratio",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.boiler_excess_air).speed(0.01));
                     ui.end_row();
 
-                    label_with_tip(ui, "복사/표면 손실 [%]", "표면 복사/대류 손실 비율");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.boiler.ptc.rad_loss", "Radiation/surface loss [%]"),
+                        &txt(
+                            "gui.boiler.ptc.rad_loss_tip",
+                            "Surface radiation/convection loss fraction",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.boiler_rad_loss).speed(0.005));
                     ui.end_row();
 
-                    label_with_tip(ui, "블로다운 비율", "보일러 블로다운(배수) 비율");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.boiler.ptc.blowdown_rate", "Blowdown rate"),
+                        &txt(
+                            "gui.boiler.ptc.blowdown_rate_tip",
+                            "Boiler blowdown fraction",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.boiler_blowdown_rate).speed(0.005));
                     ui.end_row();
 
-                    label_with_tip(ui, "블로다운 엔탈피", "블로다운 배출수 엔탈피");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.boiler.ptc.blowdown_h", "Blowdown enthalpy"),
+                        &txt("gui.boiler.ptc.blowdown_h_tip", "Blowdown effluent enthalpy"),
+                    );
                     ui.add(egui::DragValue::new(&mut self.boiler_blowdown_h).speed(5.0));
                     unit_combo(
                         ui,
@@ -2164,7 +2883,10 @@ impl GuiApp {
                     ui.end_row();
                 });
 
-            if ui.button("PTC 4.0 효율 계산").clicked() {
+            if ui
+                .button(txt("gui.boiler.ptc.run", "Calculate PTC 4.0 efficiency"))
+                .clicked()
+            {
                 let input = steam::boiler_efficiency::BoilerEfficiencyPtcInput {
                     fuel_flow_per_h: self.boiler_fuel_flow,
                     fuel_lhv_kj_per_unit: convert_energy_gui(
@@ -2213,11 +2935,16 @@ impl GuiApp {
                     ),
                 };
                 let res = steam::boiler_efficiency::boiler_efficiency_ptc(input);
-                self.boiler_result = Some(format!(
-                    "PTC 효율={:.2} %, 유효열={:.1} kW, 연료열={:.1} kW",
-                    res.efficiency * 100.0,
-                    res.useful_heat_kw,
-                    res.fuel_heat_kw
+                self.boiler_result = Some(fill_template(
+                    &txt(
+                        "gui.boiler.ptc.result",
+                        "PTC efficiency={eff:.2} %, Useful heat={useful:.1} kW, Fuel heat={fuel:.1} kW",
+                    ),
+                    &[
+                        ("eff", format!("{:.2}", res.efficiency * 100.0)),
+                        ("useful", format!("{:.1}", res.useful_heat_kw)),
+                        ("fuel", format!("{:.1}", res.fuel_heat_kw)),
+                    ],
                 ));
             }
             if let Some(res) = &self.boiler_result {
@@ -2229,15 +2956,31 @@ impl GuiApp {
 
     /// 콘덴서/냉각탑/펌프 NPSH/드레인 쿨러 계산을 묶은 화면.
     fn ui_cooling(&mut self, ui: &mut egui::Ui) {
+        let tr = self.tr.clone();
+        let txt = move |key: &str, default: &str| {
+            tr.lookup(key).unwrap_or_else(|| default.to_string())
+        };
         heading_with_tip(
             ui,
-            "Cooling / Condenser / NPSH / Drain Cooler",
-            "복수기 열수지, 냉각탑 Range/Approach, 펌프 NPSH, 드레인/재열기 LMTD 계산",
+            &txt(
+                "gui.cooling.heading",
+                "Cooling / Condenser / NPSH / Drain Cooler",
+            ),
+            &txt(
+                "gui.cooling.tip",
+                "Condenser heat balance, cooling tower range/approach, pump NPSH, drain/reheater LMTD",
+            ),
         );
         label_with_tip(
             ui,
-            "복수기 열수지, 냉각탑 Range/Approach, 펌프 NPSH, 드레인/재열기 LMTD 계산",
-            "각 카드별로 필요한 값을 입력하면 즉시 계산됩니다.",
+            &txt(
+                "gui.cooling.subheading",
+                "Condenser heat balance, cooling tower range/approach, pump NPSH, drain/reheater LMTD",
+            ),
+            &txt(
+                "gui.cooling.subhint",
+                "Fill each card to compute instantly.",
+            ),
         );
         ui.add_space(8.0);
 
@@ -2245,20 +2988,39 @@ impl GuiApp {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             heading_with_tip(
                 ui,
-                "Condenser Heat Balance / Vacuum",
-                "증기 포화온도·진공·LMTD를 동시에 계산하는 복수기 카드",
+                &txt(
+                    "gui.cooling.cond.heading",
+                    "Condenser Heat Balance / Vacuum",
+                ),
+                &txt(
+                    "gui.cooling.cond.tip",
+                    "Card to compute steam Tsat/vacuum/LMTD together",
+                ),
             );
-            ui.small("증기 포화온도/LMTD 자동 계산, mmHg는 게이지(0=대기) 해석");
+            ui.small(txt(
+                "gui.cooling.cond.note",
+                "Steam Tsat/LMTD auto calc; mmHg is gauge (0=atm).",
+            ));
             egui::Grid::new("condenser_grid")
                 .num_columns(4)
                 .spacing([8.0, 6.0])
                 .show(ui, |ui| {
                     ui.checkbox(
                         &mut self.condenser_auto_condensing_from_pressure,
-                        "auto Tsat",
+                        txt("gui.cooling.cond.auto_tsat", "auto Tsat"),
                     )
-                    .on_hover_text("체크 시 압력으로부터 포화온도/압력을 자동 계산합니다.");
-                    label_with_tip(ui, "증기 압력", "복수기 상부의 증기/불응축 가스 압력");
+                    .on_hover_text(txt(
+                        "gui.cooling.cond.auto_tsat_tip",
+                        "Use pressure to auto-calc Tsat/Psat.",
+                    ));
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.cond.steam_p", "Steam pressure"),
+                        &txt(
+                            "gui.cooling.cond.steam_p_tip",
+                            "Condenser steam/non-condensable pressure",
+                        ),
+                    );
                     if ui
                         .add(egui::DragValue::new(&mut self.condenser_pressure).speed(0.05))
                         .changed()
@@ -2270,22 +3032,32 @@ impl GuiApp {
                         ui.selectable_value(
                             &mut self.condenser_pressure_mode,
                             conversion::PressureMode::Gauge,
-                            "Gauge (G)",
+                            txt("gui.steam.mode.gauge", "Gauge (G)"),
                         );
                         ui.selectable_value(
                             &mut self.condenser_pressure_mode,
                             conversion::PressureMode::Absolute,
-                            "Absolute (A)",
+                            txt("gui.steam.mode.absolute", "Absolute (A)"),
                         );
                     });
                     ui.end_row();
 
                     ui.checkbox(
                         &mut self.condenser_auto_backpressure_from_temp,
-                        "auto Psat",
+                        txt("gui.cooling.cond.auto_psat", "auto Psat"),
                     )
-                    .on_hover_text("체크 시 포화온도로부터 포화압을 자동 산출합니다.");
-                    label_with_tip(ui, "증기 온도", "복수기 증기 온도 (포화온도 자동 계산 가능)");
+                    .on_hover_text(txt(
+                        "gui.cooling.cond.auto_psat_tip",
+                        "Use Tsat to auto-calc Psat.",
+                    ));
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.cond.steam_t", "Steam temperature"),
+                        &txt(
+                            "gui.cooling.cond.steam_t_tip",
+                            "Condenser steam temperature (auto Tsat possible)",
+                        ),
+                    );
                     if ui
                         .add(egui::DragValue::new(&mut self.condenser_temp_c).speed(0.5))
                         .changed()
@@ -2295,15 +3067,28 @@ impl GuiApp {
                         self.condenser_use_manual_temp = true;
                     }
                     unit_combo(ui, &mut self.condenser_cw_temp_unit, temperature_unit_options());
-                    ui.checkbox(&mut self.condenser_use_manual_temp, "직접 입력");
+                    ui.checkbox(
+                        &mut self.condenser_use_manual_temp,
+                        txt("gui.cooling.cond.manual_input", "Manual input"),
+                    );
                     ui.end_row();
 
                     ui.checkbox(
                         &mut self.condenser_auto_cw_out_from_range,
-                        "auto Tout",
+                        txt("gui.cooling.cond.auto_tout", "auto Tout"),
                     )
-                    .on_hover_text("체크 시 Range(입구-출구 목표)로 출구 온도를 자동 계산합니다.");
-                    label_with_tip(ui, "냉각수 입구/출구", "순환 냉각수의 입구/출구 온도 (auto Range 계산 가능)");
+                    .on_hover_text(txt(
+                        "gui.cooling.cond.auto_tout_tip",
+                        "Use range target to auto-calc outlet temp.",
+                    ));
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.cond.cw_in_out", "Cooling water in/out"),
+                        &txt(
+                            "gui.cooling.cond.cw_in_out_tip",
+                            "Circulating cooling water inlet/outlet temps (auto range supported)",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.condenser_cw_in).speed(0.5));
                     if ui
                         .add(egui::DragValue::new(&mut self.condenser_cw_out).speed(0.5))
@@ -2314,13 +3099,27 @@ impl GuiApp {
                     unit_combo(ui, &mut self.condenser_cw_temp_unit, temperature_unit_options());
                     ui.end_row();
 
-                    label_with_tip(ui, "Range 목표(입구-출구)", "냉각수 입구-출구 온도 차 목표치");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.cond.range_target", "Range target (in-out)"),
+                        &txt(
+                            "gui.cooling.cond.range_target_tip",
+                            "Cooling water inlet-outlet temperature difference target",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.ct_range_target).speed(0.2));
                     ui.label("°C");
                     ui.end_row();
 
                     ui.label("");
-                    label_with_tip(ui, "냉각수 유량", "순환 냉각수 유량");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.cond.cw_flow", "Cooling water flow"),
+                        &txt(
+                            "gui.cooling.cond.cw_flow_tip",
+                            "Circulating cooling water flow",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.condenser_cw_flow).speed(5.0));
                     unit_combo(
                         ui,
@@ -2336,9 +3135,19 @@ impl GuiApp {
                     );
                     ui.end_row();
 
-                    ui.checkbox(&mut self.condenser_auto_ua_from_area_u, "auto UA")
-                        .on_hover_text("체크 시 면적×U로 UA를 자동 계산합니다.");
-                    label_with_tip(ui, "UA [kW/K]", "전열면적×전달계수");
+                    ui.checkbox(
+                        &mut self.condenser_auto_ua_from_area_u,
+                        txt("gui.cooling.cond.auto_ua", "auto UA"),
+                    )
+                    .on_hover_text(txt(
+                        "gui.cooling.cond.auto_ua_tip",
+                        "Auto-calc UA from area × U",
+                    ));
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.cond.ua", "UA [kW/K]"),
+                        &txt("gui.cooling.cond.ua_tip", "Area × U"),
+                    );
                     if ui
                         .add(egui::DragValue::new(&mut self.condenser_ua).speed(1.0))
                         .changed()
@@ -2349,10 +3158,20 @@ impl GuiApp {
 
                     ui.checkbox(
                         &mut self.condenser_auto_area_required,
-                        "auto 면적(요구)",
+                        txt("gui.cooling.cond.auto_area", "auto area (required)"),
                     )
-                    .on_hover_text("체크 시 필요한 면적을 계산합니다. 해제하면 입력한 면적을 검증에 사용합니다.");
-                    label_with_tip(ui, "면적/ U", "전열면적, U값을 직접 입력하여 검증");
+                    .on_hover_text(txt(
+                        "gui.cooling.cond.auto_area_tip",
+                        "Auto-calc required area; uncheck to validate entered area.",
+                    ));
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.cond.area_u", "Area / U"),
+                        &txt(
+                            "gui.cooling.cond.area_u_tip",
+                            "Enter heat transfer area and U to validate",
+                        ),
+                    );
                     if ui
                         .add(egui::DragValue::new(&mut self.condenser_area).speed(0.5))
                         .changed()
@@ -2368,8 +3187,18 @@ impl GuiApp {
                     ui.label("area[m²], U[W/m²K]");
                     ui.end_row();
 
-                    ui.checkbox(&mut self.condenser_auto_backpressure_from_temp, "auto 배압");
-                    label_with_tip(ui, "목표 배압", "압축기/터빈 배압 목표를 입력하거나 Tsat로부터 자동 계산");
+                    ui.checkbox(
+                        &mut self.condenser_auto_backpressure_from_temp,
+                        txt("gui.cooling.cond.auto_backpressure", "auto backpressure"),
+                    );
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.cond.backpressure", "Target backpressure"),
+                        &txt(
+                            "gui.cooling.cond.backpressure_tip",
+                            "Enter compressor/turbine backpressure target or auto-calc from Tsat",
+                        ),
+                    );
                     if ui
                         .add(egui::DragValue::new(&mut self.condenser_backpressure).speed(0.05))
                         .changed()
@@ -2385,23 +3214,38 @@ impl GuiApp {
                         ui.selectable_value(
                             &mut self.condenser_backpressure_mode,
                             conversion::PressureMode::Absolute,
-                            "Absolute (A)",
+                            txt("gui.steam.mode.absolute", "Absolute (A)"),
                         );
                         ui.selectable_value(
                             &mut self.condenser_backpressure_mode,
                             conversion::PressureMode::Gauge,
-                            "Gauge (G)",
+                            txt("gui.steam.mode.gauge", "Gauge (G)"),
                         );
                     });
                     ui.end_row();
                 });
-            ui.collapsing("입력 도움말", |ui| {
-                ui.label("배압/포화압: 포화압력 = 응축기 진공. Gauge는 대기 기준.");
-                ui.label("UA: U[W/m²K] × Area[m²] / 1000 = kW/K.");
-                ui.label("Range: 냉각수 입구-출구 온도차. auto 체크 시 출구온도 자동 산출.");
-                ui.label("mmHg는 게이지(0=대기, -760=진공) 해석.");
+            ui.collapsing(txt("gui.cooling.cond.help", "Input help"), |ui| {
+                ui.label(txt(
+                    "gui.cooling.cond.help_backpressure",
+                    "Backpressure/Psat: Psat = condenser vacuum. Gauge is atm-referenced.",
+                ));
+                ui.label(txt(
+                    "gui.cooling.cond.help_ua",
+                    "UA: U[W/m²K] × Area[m²] / 1000 = kW/K.",
+                ));
+                ui.label(txt(
+                    "gui.cooling.cond.help_range",
+                    "Range: CW inlet-outlet ΔT. Auto checked → outlet auto-calculated.",
+                ));
+                ui.label(txt(
+                    "gui.cooling.cond.help_mmhg",
+                    "mmHg is gauge (0=atm, -760=vacuum).",
+                ));
             });
-            if ui.button("콘덴서 계산").clicked() {
+            if ui
+                .button(txt("gui.cooling.cond.run", "Run condenser calc"))
+                .clicked()
+            {
                 // 입력값 보정/자동산출
                 let mut steam_temp_c = if self.condenser_use_manual_temp {
                     Some(convert_temperature_gui(
@@ -2522,22 +3366,30 @@ impl GuiApp {
                             &self.condenser_pressure_unit,
                             self.condenser_pressure_mode,
                         );
-                        let mut text = format!(
-                            "Tsat={:.2} {}, Psat={:.4} {}{}, LMTD={:.2} K, Q~{:.1} kW",
-                            cond_temp_out,
-                            self.condenser_cw_temp_unit,
-                            cond_press_out,
-                            self.condenser_pressure_unit,
-                            if self.condenser_pressure_mode == conversion::PressureMode::Gauge {
-                                "g"
-                            } else {
-                                "a"
-                            },
-                            res.lmtd_k,
-                            res.heat_duty_kw
+                        let mut text = fill_template(
+                            &txt(
+                                "gui.cooling.cond.result",
+                                "Tsat={tsat:.2} {t_unit}, Psat={psat:.4} {p_unit}{mode}, LMTD={lmtd:.2} K, Q≈{q:.1} kW",
+                            ),
+                            &[
+                                ("tsat", format!("{:.2}", cond_temp_out)),
+                                ("t_unit", self.condenser_cw_temp_unit.clone()),
+                                ("psat", format!("{:.4}", cond_press_out)),
+                                ("p_unit", self.condenser_pressure_unit.clone()),
+                                (
+                                    "mode",
+                                    if self.condenser_pressure_mode == conversion::PressureMode::Gauge {
+                                        "g".into()
+                                    } else {
+                                        "a".into()
+                                    },
+                                ),
+                                ("lmtd", format!("{:.2}", res.lmtd_k)),
+                                ("q", format!("{:.1}", res.heat_duty_kw)),
+                            ],
                         );
                         if !res.warnings.is_empty() {
-                            text.push_str("\n경고: ");
+                            text.push_str(&txt("gui.cooling.cond.warn_prefix", "\nWarning: "));
                             text.push_str(&res.warnings.join(" / "));
                         }
                         // 면적/UA 관련 추가 정보
@@ -2545,7 +3397,16 @@ impl GuiApp {
                             let area_req =
                                 (res.heat_duty_kw * 1000.0) / (self.condenser_u * res.lmtd_k.max(1e-6));
                             self.condenser_area = area_req;
-                            text.push_str(&format!("\n요구 면적~{:.2} m² (U={:.1} W/m²K)", area_req, self.condenser_u));
+                            text.push_str(&fill_template(
+                                &txt(
+                                    "gui.cooling.cond.area_req",
+                                    "\nRequired area≈{area:.2} m² (U={u:.1} W/m²K)",
+                                ),
+                                &[
+                                    ("area", format!("{:.2}", area_req)),
+                                    ("u", format!("{:.1}", self.condenser_u)),
+                                ],
+                            ));
                         } else if !self.condenser_auto_area_required
                             && self.condenser_area > 0.0
                             && self.condenser_u > 0.0
@@ -2561,33 +3422,54 @@ impl GuiApp {
                             } else {
                                 0.0
                             };
-                            text.push_str(&format!(
-                                "\n입력 면적={:.2} m², U={:.1} W/m²K 기준 Qcap~{:.1} kW, 부하비~{:.2}x",
-                                self.condenser_area, self.condenser_u, q_cap, load_ratio
+                            text.push_str(&fill_template(
+                                &txt(
+                                    "gui.cooling.cond.area_check",
+                                    "\nArea={area:.2} m², U={u:.1} W/m²K → Qcap≈{qcap:.1} kW, load ratio≈{lr:.2}x",
+                                ),
+                                &[
+                                    ("area", format!("{:.2}", self.condenser_area)),
+                                    ("u", format!("{:.1}", self.condenser_u)),
+                                    ("qcap", format!("{:.1}", q_cap)),
+                                    ("lr", format!("{:.2}", load_ratio)),
+                                ],
                             ));
                             if load_ratio > 1.0 {
-                                text.push_str(&format!(
-                                    "\n⚠ 현재 부하가 설계 용량을 초과합니다. 현 조건에서 약 {:.0}% 수준까지 운전 가능(Qcap 기준). 냉각수 온도/유량 개선 또는 면적/U 증대 필요.",
-                                    capable_pct
+                                text.push_str(&fill_template(
+                                    &txt(
+                                        "gui.cooling.cond.area_warn_over",
+                                        "\n⚠ Load exceeds design. Operable to about {pct:.0}% (Qcap basis). Lower CW temp/raise flow or increase area/U.",
+                                    ),
+                                    &[("pct", format!("{:.0}", capable_pct))],
                                 ));
                             } else {
-                                text.push_str("\n정상 운전 예상(부하 ≤ 설계 용량).");
+                                text.push_str(&txt(
+                                    "gui.cooling.cond.area_warn_ok",
+                                    "\nWithin design load (load ≤ capacity).",
+                                ));
                             }
                         }
                         text
                     }
                     Err(e) => match e {
                         condenser::CoolingError::NegativeDeltaT => {
-                            "오류: 냉각수 온도와 포화온도가 역전되었습니다.".into()
+                            txt(
+                                "gui.cooling.cond.error.delta_t",
+                                "Error: cooling water temperature crosses saturation temperature.",
+                            )
+                            .to_string()
                         }
-                        condenser::CoolingError::If97(msg) => format!("포화 계산 오류: {msg}"),
+                        condenser::CoolingError::If97(msg) => fill_template(
+                            &txt("gui.cooling.cond.error.if97", "Saturation calc error: {msg}"),
+                            &[("msg", msg)],
+                        ),
                     },
                 });
             }
             if let Some(res) = &self.condenser_result {
                 ui.separator();
                 for line in res.lines() {
-                    if line.starts_with("경고:") {
+                    if line.starts_with(&txt("gui.cooling.cond.warn_prefix", "Warning:")) {
                         ui.colored_label(ui.visuals().warn_fg_color, line);
                     } else {
                         ui.label(line);
@@ -2683,32 +3565,60 @@ impl GuiApp {
                 .num_columns(3)
                 .spacing([10.0, 6.0])
                 .show(ui, |ui| {
-                    label_with_tip(ui, "흡입 압력", "펌프 흡입 측 압력 (게이지/절대)");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.npsh.suction_p", "Suction pressure"),
+                        &txt(
+                            "gui.cooling.npsh.suction_p_tip",
+                            "Pump suction pressure (gauge/absolute)",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.npsh_suction_p).speed(0.1));
                     unit_combo(ui, &mut self.npsh_suction_unit, pressure_unit_options());
                     ui.selectable_value(
                         &mut self.npsh_suction_mode,
                         conversion::PressureMode::Gauge,
-                        "Gauge (G)",
+                        txt("gui.steam.mode.gauge", "Gauge (G)"),
                     );
                     ui.selectable_value(
                         &mut self.npsh_suction_mode,
                         conversion::PressureMode::Absolute,
-                        "Absolute (A)",
+                        txt("gui.steam.mode.absolute", "Absolute (A)"),
                     );
                     ui.end_row();
 
-                    label_with_tip(ui, "수온", "흡입수 온도 (증기압 계산)");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.npsh.temp", "Liquid temperature"),
+                        &txt(
+                            "gui.cooling.npsh.temp_tip",
+                            "Suction liquid temperature (for vapor pressure)",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.npsh_temp).speed(0.5));
                     unit_combo(ui, &mut self.npsh_temp_unit, temperature_unit_options());
                     ui.end_row();
 
-                    label_with_tip(ui, "정수두 / 마찰손실 [m]", "흡입면에서 펌프까지 정수두 / 손실수두");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.npsh.head_friction", "Static head / friction [m]"),
+                        &txt(
+                            "gui.cooling.npsh.head_friction_tip",
+                            "Static head from surface to pump / friction head loss",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.npsh_static_head).speed(0.2));
                     ui.add(egui::DragValue::new(&mut self.npsh_friction).speed(0.2));
                     ui.end_row();
 
-                    label_with_tip(ui, "밀도 / NPSHr", "흡입수 밀도와 제조사 제시 NPSHr");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.npsh.rho_npshr", "Density / NPSHr"),
+                        &txt(
+                            "gui.cooling.npsh.rho_npshr_tip",
+                            "Suction liquid density and manufacturer NPSHr",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.npsh_rho).speed(1.0));
                     unit_combo(
                         ui,
@@ -2718,7 +3628,10 @@ impl GuiApp {
                     ui.add(egui::DragValue::new(&mut self.npsh_required).speed(0.2));
                     ui.end_row();
                 });
-            if ui.button("NPSH 계산").clicked() {
+            if ui
+                .button(txt("gui.cooling.npsh.run", "Run NPSH calc"))
+                .clicked()
+            {
                 let rho = convert_density_gui(self.npsh_rho, &self.npsh_rho_unit, "kg/m3");
                 let p_bar = convert_pressure_mode_gui(
                     self.npsh_suction_p,
@@ -2737,12 +3650,18 @@ impl GuiApp {
                     npshr_m: self.npsh_required,
                     rho_kg_m3: rho,
                 });
-                let mut msg = format!(
-                    "NPSHa={:.2} m, Margin={:.2}",
-                    res.npsha_m, res.margin_ratio
+                let mut msg = fill_template(
+                    &txt(
+                        "gui.cooling.npsh.result",
+                        "NPSHa={npsha:.2} m, Margin={margin:.2}",
+                    ),
+                    &[
+                        ("npsha", format!("{:.2}", res.npsha_m)),
+                        ("margin", format!("{:.2}", res.margin_ratio)),
+                    ],
                 );
                 if !res.warnings.is_empty() {
-                    msg.push_str("\n경고: ");
+                    msg.push_str(&txt("gui.cooling.npsh.warn_prefix", "\nWarning: "));
                     msg.push_str(&res.warnings.join(" / "));
                 }
                 self.npsh_result = Some(msg);
@@ -2750,13 +3669,16 @@ impl GuiApp {
             if let Some(res) = &self.npsh_result {
                 ui.separator();
                 for line in res.lines() {
-                    if line.starts_with("경고:") {
+                    if line.starts_with(&txt("gui.cooling.npsh.warn_prefix", "Warning:")) {
                         ui.colored_label(ui.visuals().warn_fg_color, line);
                     } else {
                         ui.label(line);
                     }
                 }
-                ui.small("참고: Margin<1.1이면 공동현상 위험이 큽니다. 흡입압 상승/온도 저하/마찰손실 감소를 검토하십시오.");
+                ui.small(txt(
+                    "gui.cooling.npsh.note",
+                    "Note: Margin<1.1 ⇒ high cavitation risk. Raise suction pressure / lower temperature / cut friction.",
+                ));
             }
         });
 
@@ -2765,24 +3687,42 @@ impl GuiApp {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             heading_with_tip(
                 ui,
-                "Drain Cooler / Reheater Heat Balance",
-                "쉘/튜브 입출구 온도·유량으로 LMTD와 열수지를 계산",
+                &txt(
+                    "gui.cooling.drain.heading",
+                    "Drain Cooler / Reheater Heat Balance",
+                ),
+                &txt(
+                    "gui.cooling.drain.tip",
+                    "Compute LMTD and heat balance from shell/tube inlet/outlet temps and flows",
+                ),
             );
             egui::Grid::new("drain_grid")
                 .num_columns(3)
                 .spacing([10.0, 6.0])
                 .show(ui, |ui| {
-                    label_with_tip(ui, "쉘 IN/OUT", "쉘측 입구/출구 온도");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.drain.shell_in_out", "Shell IN/OUT"),
+                        &txt("gui.cooling.drain.shell_in_out_tip", "Shell-side inlet/outlet temperature"),
+                    );
                     ui.add(egui::DragValue::new(&mut self.drain_shell_in).speed(0.5));
                     ui.add(egui::DragValue::new(&mut self.drain_shell_out).speed(0.5));
                     unit_combo(ui, &mut self.drain_temp_unit, temperature_unit_options());
                     ui.end_row();
-                    label_with_tip(ui, "튜브 IN/OUT", "튜브측 입구/출구 온도");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.drain.tube_in_out", "Tube IN/OUT"),
+                        &txt("gui.cooling.drain.tube_in_out_tip", "Tube-side inlet/outlet temperature"),
+                    );
                     ui.add(egui::DragValue::new(&mut self.drain_tube_in).speed(0.5));
                     ui.add(egui::DragValue::new(&mut self.drain_tube_out).speed(0.5));
                     unit_combo(ui, &mut self.drain_temp_unit, temperature_unit_options());
                     ui.end_row();
-                    label_with_tip(ui, "쉘/튜브 유량", "쉘측/튜브측 유량");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.drain.flow", "Shell/Tube flow"),
+                        &txt("gui.cooling.drain.flow_tip", "Shell-side / tube-side flow"),
+                    );
                     ui.add(egui::DragValue::new(&mut self.drain_shell_flow).speed(1.0));
                     ui.add(egui::DragValue::new(&mut self.drain_tube_flow).speed(1.0));
                     unit_combo(
@@ -2791,13 +3731,23 @@ impl GuiApp {
                         &[("m3/h", "m3/h"), ("gpm", "gpm")],
                     );
                     ui.end_row();
-                    label_with_tip(ui, "UA 또는 면적/U", "UA 직접 입력 또는 면적/U를 입력해 UA 산출");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.cooling.drain.ua_area_u", "UA or Area/U"),
+                        &txt(
+                            "gui.cooling.drain.ua_area_u_tip",
+                            "Enter UA directly or area/U to compute UA",
+                        ),
+                    );
                     ui.add(egui::DragValue::new(&mut self.drain_ua).speed(1.0));
                     ui.add(egui::DragValue::new(&mut self.drain_area).speed(0.5));
                     ui.add(egui::DragValue::new(&mut self.drain_u).speed(5.0));
                     ui.end_row();
                 });
-            if ui.button("열수지 계산").clicked() {
+            if ui
+                .button(txt("gui.cooling.drain.run", "Run heat balance"))
+                .clicked()
+            {
                 let flow_shell_m3h = if self.drain_flow_unit.eq_ignore_ascii_case("gpm") {
                     self.drain_shell_flow * 0.2271247
                 } else {
@@ -2833,14 +3783,26 @@ impl GuiApp {
                     } else {
                         None
                     },
-                    overall_u_w_m2k: if self.drain_u > 0.0 { Some(self.drain_u) } else { None },
+                    overall_u_w_m2k: if self.drain_u > 0.0 {
+                        Some(self.drain_u)
+                    } else {
+                        None
+                    },
                 });
-                let mut msg = format!(
-                    "LMTD={:.2} K, 쉘 Q={:.1} kW, 튜브 Q={:.1} kW, 불균형={:.1} kW",
-                    res.lmtd_k, res.shell_heat_kw, res.tube_heat_kw, res.imbalance_kw
+                let mut msg = fill_template(
+                    &txt(
+                        "gui.cooling.drain.result",
+                        "LMTD={lmtd:.2} K, Shell Q={shell:.1} kW, Tube Q={tube:.1} kW, Imbalance={imb:.1} kW",
+                    ),
+                    &[
+                        ("lmtd", format!("{:.2}", res.lmtd_k)),
+                        ("shell", format!("{:.1}", res.shell_heat_kw)),
+                        ("tube", format!("{:.1}", res.tube_heat_kw)),
+                        ("imb", format!("{:.1}", res.imbalance_kw)),
+                    ],
                 );
                 if !res.warnings.is_empty() {
-                    msg.push_str("\n경고: ");
+                    msg.push_str(&txt("gui.cooling.drain.warn_prefix", "\nWarning: "));
                     msg.push_str(&res.warnings.join(" / "));
                 }
                 self.drain_result = Some(msg);
@@ -2848,7 +3810,7 @@ impl GuiApp {
             if let Some(res) = &self.drain_result {
                 ui.separator();
                 for line in res.lines() {
-                    if line.starts_with("경고:") {
+                    if line.starts_with(&txt("gui.cooling.drain.warn_prefix", "Warning:")) {
                         ui.colored_label(ui.visuals().warn_fg_color, line);
                     } else {
                         ui.label(line);
@@ -2860,59 +3822,105 @@ impl GuiApp {
 
     /// 플랜트 배관: 오리피스/노즐 유량 점검 + 재질별 열팽창 계산
     fn ui_plant_piping(&mut self, ui: &mut egui::Ui) {
-        heading_with_tip(ui, "Plant Piping", "오리피스/노즐 유량, 열팽창, 내압 계산");
+        let tr = self.tr.clone();
+        let txt = move |key: &str, default: &str| {
+            tr.lookup(key).unwrap_or_else(|| default.to_string())
+        };
+        heading_with_tip(
+            ui,
+            &txt("gui.plant.heading", "Plant Piping"),
+            &txt(
+                "gui.plant.tip",
+                "Orifice/nozzle flow, thermal expansion, pressure rating",
+            ),
+        );
         label_with_tip(
             ui,
-            "오리피스·노즐 유량 점검, 재질별 열팽창 계산",
-            "압축성 보정(Y), 열팽창량, 내압까지 한 화면에서 계산",
+            &txt("gui.plant.subheading", "Orifice/nozzle check, thermal expansion, pressure rating"),
+            &txt(
+                "gui.plant.subhint",
+                "Compressibility(Y), expansion, and pressure rating on one screen",
+            ),
         );
         ui.add_space(8.0);
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            heading_with_tip(ui, "Orifice / Nozzle 유량 점검", "차압식 유량계 또는 노즐 유량 검증");
+            heading_with_tip(
+                ui,
+                &txt("gui.plant.orifice.heading", "Orifice / Nozzle flow check"),
+                &txt(
+                    "gui.plant.orifice.tip",
+                    "Verify differential-pressure meter or nozzle flow",
+                ),
+            );
             egui::Grid::new("plant_orifice")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    label_with_tip(ui, "상류 압력", "노즐/오리피스 상류 압력 (게이지/절대)");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.plant.orifice.up_p", "{t_up_p}"),
+                        &txt(
+                            "gui.plant.orifice.up_p_tip",
+                            "Nozzle/orifice {t_up_p} (gauge/absolute)",
+                        ),
+                    );
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut self.plant_up_p).speed(0.1));
                         unit_combo(ui, &mut self.plant_up_unit, pressure_unit_options());
                         ui.selectable_value(
                             &mut self.plant_up_mode,
                             conversion::PressureMode::Gauge,
-                            "Gauge (G)",
+                            txt("gui.steam.mode.gauge", "Gauge (G)"),
                         );
                         ui.selectable_value(
                             &mut self.plant_up_mode,
                             conversion::PressureMode::Absolute,
-                            "Absolute (A)",
+                            txt("gui.steam.mode.absolute", "Absolute (A)"),
                         );
                     });
                     ui.end_row();
 
-                    label_with_tip(ui, "차압", "오리피스 양단의 압력차 ΔP");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.plant.orifice.dp", "ΔP"),
+                        &txt(
+                            "gui.plant.orifice.dp_tip",
+                            "Pressure drop across orifice/nozzle",
+                        ),
+                    );
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut self.plant_dp).speed(0.1));
                         unit_combo(ui, &mut self.plant_dp_unit, pressure_unit_options());
                         ui.selectable_value(
                             &mut self.plant_dp_mode,
                             conversion::PressureMode::Gauge,
-                            "Gauge (G)",
+                            txt("gui.steam.mode.gauge", "Gauge (G)"),
                         );
                         ui.selectable_value(
                             &mut self.plant_dp_mode,
                             conversion::PressureMode::Absolute,
-                            "Absolute (A)",
+                            txt("gui.steam.mode.absolute", "Absolute (A)"),
                         );
                     });
                     ui.end_row();
 
-                    label_with_tip(ui, "유체 밀도 [kg/m3]", "운전 조건에서의 밀도");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.plant.orifice.rho", "Fluid density"),
+                        &txt("gui.plant.orifice.rho_tip", "Density at operating condition"),
+                    );
                     ui.add(egui::DragValue::new(&mut self.plant_rho).speed(1.0));
                     ui.end_row();
 
-                    label_with_tip(ui, "지름", "오리피스/노즐 유효 지름 (m 또는 mm)");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.plant.orifice.diameter", "Diameter"),
+                        &txt(
+                            "gui.plant.orifice.diameter_tip",
+                            "Orifice/nozzle effective diameter (m or mm)",
+                        ),
+                    );
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::DragValue::new(&mut self.plant_diameter_m)
@@ -2923,7 +3931,14 @@ impl GuiApp {
                     });
                     ui.end_row();
 
-                    label_with_tip(ui, "형상 / Cd", "형상별 Cd 기본값 선택 후 필요시 미세 조정");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.plant.orifice.shape_cd", "Shape / Cd"),
+                        &txt(
+                            "gui.plant.orifice.shape_cd_tip",
+                            "Select shape to set Cd; adjust if needed",
+                        ),
+                    );
                     ui.horizontal(|ui| {
                         egui::ComboBox::from_id_source("plant_shape")
                             .selected_text(&self.plant_shape)
@@ -2963,7 +3978,14 @@ impl GuiApp {
                     });
                     ui.end_row();
 
-                    label_with_tip(ui, "Beta(지름비) / k(비열비)", "beta=오리피스/관 지름비, k=비열비(γ)");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.plant.orifice.beta_k", "Beta(diameter ratio) / k(specific heat ratio)"),
+                        &txt(
+                            "gui.plant.orifice.beta_k_tip",
+                            "beta=orifice/pipe diameter ratio, k=gamma",
+                        ),
+                    );
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::DragValue::new(&mut self.plant_beta)
@@ -2978,11 +4000,24 @@ impl GuiApp {
                     });
                     ui.end_row();
 
-                    label_with_tip(ui, "압축성 보정 사용", "증기/가스 유량 시 Y 계수 보정 적용");
-                    ui.checkbox(&mut self.plant_compressible, "Compressible (Y 적용)");
+                    label_with_tip(
+                        ui,
+                        &txt("gui.plant.orifice.compressible", "Use compressible correction"),
+                        &txt(
+                            "gui.plant.orifice.compressible_tip",
+                            "Apply Y-factor for steam/gas flow",
+                        ),
+                    );
+                    ui.checkbox(
+                        &mut self.plant_compressible,
+                        txt("gui.plant.orifice.compressible_toggle", "Compressible (Y)"),
+                    );
                     ui.end_row();
                 });
-            if ui.button("유량 계산").clicked() {
+            if ui
+                .button(txt("gui.plant.orifice.run", "Calculate flow"))
+                .clicked()
+            {
                 let dp_bar = convert_pressure_mode_gui(
                     self.plant_dp,
                     &self.plant_dp_unit,
@@ -2999,14 +4034,21 @@ impl GuiApp {
                 );
                 let d_m = convert_length_gui(self.plant_diameter_m, &self.plant_diam_unit, "m");
                 if dp_bar <= 0.0 || self.plant_rho <= 0.0 || d_m <= 0.0 {
-                    self.plant_result = Some("입력 오류: ΔP, 밀도, 지름은 0보다 커야 합니다.".into());
+                    self.plant_result = Some(txt(
+                        "gui.plant.orifice.error.input",
+                        "Error: ΔP, density, and diameter must be > 0.",
+                    )
+                    .to_string());
                 } else {
                     let dp_pa = dp_bar * 1.0e5;
                     let area = std::f64::consts::PI * (d_m.powi(2)) / 4.0;
                     if self.plant_compressible {
                         if pu_bar_abs <= dp_bar {
-                            self.plant_result =
-                                Some("입력 오류: 상류 압력이 차압보다 커야 합니다 (압축성 계산)".into());
+                            self.plant_result = Some(txt(
+                                "gui.plant.orifice.error.up_lt_dp",
+                                "Error: upstream pressure must exceed ΔP (compressible).",
+                            )
+                            .to_string());
                         } else {
                             let beta = self.plant_beta.clamp(0.1, 0.99);
                             let k = self.plant_gamma.clamp(1.0, 1.7);
@@ -3016,312 +4058,60 @@ impl GuiApp {
                             let m_kg_s = c * y * area * (2.0 * self.plant_rho * dp_pa).sqrt();
                             let m_kg_h = m_kg_s * 3600.0;
                             let q_m3_h = m_kg_h / self.plant_rho;
-                            self.plant_result = Some(format!(
-                                "압축성: Q ~ {:.3} m³/h, m ~ {:.2} kg/h (Cd={:.2}, Y={:.3}, beta={:.2}, k={:.2}, dp={:.3} bar)",
-                                q_m3_h, m_kg_h, self.plant_cd, y, beta, k, dp_bar
+                            self.plant_result = Some(fill_template(
+                                &txt(
+                                    "gui.plant.orifice.result.comp",
+                                    "Compressible: Q≈{q:.3} m³/h, m≈{m:.2} kg/h (Cd={cd:.2}, Y={y:.3}, beta={beta:.2}, k={k:.2}, dp={dp:.3} bar)",
+                                ),
+                                &[
+                                    ("q", format!("{:.3}", q_m3_h)),
+                                    ("m", format!("{:.2}", m_kg_h)),
+                                    ("cd", format!("{:.2}", self.plant_cd)),
+                                    ("y", format!("{:.3}", y)),
+                                    ("beta", format!("{:.2}", beta)),
+                                    ("k", format!("{:.2}", k)),
+                                    ("dp", format!("{:.3}", dp_bar)),
+                                ],
                             ));
                         }
                     } else {
                         let q_m3_s = self.plant_cd * area * (2.0 * dp_pa / self.plant_rho).sqrt();
                         let q_m3_h = q_m3_s * 3600.0;
                         let m_kg_h = q_m3_h * self.plant_rho;
-                        self.plant_result = Some(format!(
-                            "비압축성: Q ~ {:.3} m³/h, m ~ {:.2} kg/h (Cd={:.2}, dp={:.3} bar)",
-                            q_m3_h, m_kg_h, self.plant_cd, dp_bar
+                        self.plant_result = Some(fill_template(
+                            &txt(
+                                "gui.plant.orifice.result.incomp",
+                                "Incompressible: Q≈{q:.3} m³/h, m≈{m:.2} kg/h (Cd={cd:.2}, dp={dp:.3} bar)",
+                            ),
+                            &[
+                                ("q", format!("{:.3}", q_m3_h)),
+                                ("m", format!("{:.2}", m_kg_h)),
+                                ("cd", format!("{:.2}", self.plant_cd)),
+                                ("dp", format!("{:.3}", dp_bar)),
+                            ],
                         ));
                     }
                 }
             }
             if let Some(res) = &self.plant_result {
                 ui.label(res);
-                ui.label("식: 비압축성 Q = Cd·A·√(2·ΔP/ρ), 압축성은 Y·C(1-β⁴)^-0.5 보정 적용");
+                legend_toggle(
+                    ui,
+                    &txt("legend.plant.title", "Legend / notes"),
+                    &txt("legend.plant.body", "Formula: incompressible Q = Cd·A·√(2·ΔP/ρ); compressible uses Y·C(1-β⁴)^-0.5"),
+                    &mut self.show_legend_plant,
+                );
             }
         });
-
         ui.add_space(10.0);
-
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            heading_with_tip(
-                ui,
-                "열팽창/수축 (ASTM Power Piping)",
-                "배관 길이와 ΔT로 열팽창/수축량을 산출",
-            );
-            egui::Grid::new("plant_expansion")
-                .num_columns(2)
-                .spacing([12.0, 8.0])
-                .show(ui, |ui| {
-                    label_with_tip(ui, "재질", "선팽창계수 기본값을 자동 적용할 배관 재질");
-                    egui::ComboBox::from_id_source("plant_mat")
-                        .selected_text(&self.plant_mat)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.plant_mat, "ASTM A106 Gr.B".into(), "ASTM A106 Gr.B");
-                            ui.selectable_value(&mut self.plant_mat, "ASTM A53 Gr.B".into(), "ASTM A53 Gr.B");
-                            ui.selectable_value(&mut self.plant_mat, "ASTM A312 TP304".into(), "ASTM A312 TP304");
-                            ui.selectable_value(&mut self.plant_mat, "ASTM A312 TP316".into(), "ASTM A312 TP316");
-                            ui.selectable_value(&mut self.plant_mat, "ASTM A312 TP304L".into(), "ASTM A312 TP304L");
-                            ui.selectable_value(&mut self.plant_mat, "ASTM A312 TP316L".into(), "ASTM A312 TP316L");
-                            ui.selectable_value(&mut self.plant_mat, "ASTM A335 P11".into(), "ASTM A335 P11");
-                            ui.selectable_value(&mut self.plant_mat, "ASTM A335 P12".into(), "ASTM A335 P12");
-                            ui.selectable_value(&mut self.plant_mat, "ASTM A335 P91".into(), "ASTM A335 P91");
-                            ui.selectable_value(&mut self.plant_mat, "ASTM A335 P92".into(), "ASTM A335 P92");
-                        });
-                    ui.end_row();
-
-                    label_with_tip(ui, "길이 [m]", "온도 변화가 적용되는 직선 구간 길이");
-                    ui.add(egui::DragValue::new(&mut self.plant_length_m).speed(0.1));
-                    ui.end_row();
-
-                    label_with_tip(ui, "온도 변화 ΔT [K]", "배관이 겪는 온도 변화량");
-                    ui.add(egui::DragValue::new(&mut self.plant_delta_t).speed(1.0));
-                    ui.end_row();
-
-                    label_with_tip(
-                        ui,
-                        "선팽창계수 α [1/K] (0=재질 기본)",
-                        "0이면 재질 기본, 입력 시 강제 적용",
-                    );
-                    ui.add(
-                        egui::DragValue::new(&mut self.plant_alpha_override)
-                            .speed(1e-6)
-                            .clamp_range(0.0..=5e-5),
-                    );
-                    ui.end_row();
-                });
-            if ui.button("팽창/수축 계산").clicked() {
-                let alpha_default = match self.plant_mat.as_str() {
-                    "ASTM A106 Gr.B" | "ASTM A53 Gr.B" => 12.0e-6,
-                    "ASTM A335 P11" => 11.8e-6,
-                    "ASTM A335 P12" => 11.7e-6,
-                    "ASTM A335 P91" => 11.0e-6,
-                    "ASTM A335 P92" => 11.0e-6,
-                    "ASTM A312 TP304" => 17.3e-6,
-                    "ASTM A312 TP304L" => 17.2e-6,
-                    "ASTM A312 TP316" => 16.0e-6,
-                    "ASTM A312 TP316L" => 16.0e-6,
-                    _ => 12.0e-6,
-                };
-                let alpha = if self.plant_alpha_override > 0.0 {
-                    self.plant_alpha_override
-                } else {
-                    alpha_default
-                };
-                if self.plant_length_m <= 0.0 {
-                    self.plant_expansion_result = Some("입력 오류: 길이는 0보다 커야 합니다.".into());
-                } else {
-                    let delta_l_m = alpha * self.plant_length_m * self.plant_delta_t;
-                    let delta_l_mm = delta_l_m * 1000.0;
-                    self.plant_expansion_result = Some(format!(
-                        "ΔL ~ {:.4} m (~ {:.2} mm) @ α={:.2}e-6 1/K, ΔT={:.1} K",
-                        delta_l_m,
-                        delta_l_mm,
-                        alpha * 1e6,
-                        self.plant_delta_t
-                    ));
-                }
-            }
-            if let Some(res) = &self.plant_expansion_result {
-                ui.label(res);
-                ui.label("참고: ASTM Power Piping 탄소강 ~12e-6/K, 스테인리스 ~16-17e-6/K");
-            }
-        });
-
-        ui.add_space(10.0);
-
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.heading("재질 강도 기반 내압 추정 (얇은/두꺼운 관 자동 판정)");
-            egui::Grid::new("plant_pressure_rating")
-                .num_columns(2)
-                .spacing([12.0, 8.0])
-                .show(ui, |ui| {
-                    label_with_tip(ui, "재질 선택", "허용응력 S가 이미 반영된 재질을 선택");
-                    egui::ComboBox::from_id_source("plant_strength_mat")
-                        .selected_text(&self.plant_mat)
-                        .show_ui(ui, |ui| {
-                            for (label, s_allow) in [
-                                ("ASTM A106 Gr.B", 138.0),
-                                ("ASTM A53 Gr.B", 138.0),
-                                ("ASTM A335 P11", 120.0),
-                                ("ASTM A335 P12", 110.0),
-                                ("ASTM A335 P91", 165.0),
-                                ("ASTM A335 P92", 170.0),
-                                ("ASTM A312 TP304", 138.0),
-                                ("ASTM A312 TP304L", 110.0),
-                                ("ASTM A312 TP316", 138.0),
-                                ("ASTM A312 TP316L", 110.0),
-                            ] {
-                                if ui.selectable_label(false, label).clicked() {
-                                    self.plant_mat = label.to_string();
-                                    self.plant_allow_stress_mpa = s_allow;
-                                }
-                            }
-                        });
-                    ui.end_row();
-
-                    label_with_tip(ui, "허용응력 S [MPa]", "코드에 명시된 온도별 허용응력 값을 입력/수정");
-                    ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut self.plant_allow_stress_mpa).speed(2.0));
-                    });
-                    ui.end_row();
-
-                    label_with_tip(ui, "파이프 외경 / 두께", "배관 외경과 두께(설계 기준값)");
-                    ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut self.plant_pipe_od_m).speed(0.001));
-                        ui.add(egui::DragValue::new(&mut self.plant_wall_thk_m).speed(0.0005));
-                        egui::ComboBox::from_id_source("plant_dim_unit")
-                            .selected_text(&self.plant_dim_unit)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.plant_dim_unit, "mm".into(), "mm");
-                                ui.selectable_value(&mut self.plant_dim_unit, "in".into(), "inch");
-                            });
-                    });
-                    ui.end_row();
-
-                    label_with_tip(
-                        ui,
-                        "부식여유 / 밀 톨 / 용접 효율 E / 설계계수 F",
-                        "CA: 부식여유, Mill tol: 제조 공차, E: 용접효율, F: 설계계수(지역코드/설계 여부 반영)",
-                    );
-                    ui.horizontal(|ui| {
-                        let mut ca_disp = if self.plant_dim_unit.eq_ignore_ascii_case("in") {
-                            self.plant_corrosion_allow_m / 0.0254
-                        } else {
-                            self.plant_corrosion_allow_m * 1000.0
-                        };
-                        let mut mill_pct = self.plant_mill_tol_frac * 100.0;
-                        ui.label("CA");
-                        ui.add(egui::DragValue::new(&mut ca_disp).speed(0.1).clamp_range(0.0..=20.0));
-                        ui.label(if self.plant_dim_unit.eq_ignore_ascii_case("in") {
-                            "inch"
-                        } else {
-                            "mm"
-                        });
-                        ui.separator();
-                        ui.label("밀 톨[%]");
-                        ui.add(
-                            egui::DragValue::new(&mut mill_pct)
-                                .speed(0.5)
-                                .clamp_range(0.0..=30.0),
-                        );
-                        ui.separator();
-                        ui.label("E");
-                        ui.add(
-                            egui::DragValue::new(&mut self.plant_weld_eff)
-                                .speed(0.01)
-                                .clamp_range(0.1..=1.0),
-                        );
-                        ui.label("F");
-                        ui.add(
-                            egui::DragValue::new(&mut self.plant_design_factor)
-                                .speed(0.01)
-                                .clamp_range(0.1..=1.0),
-                        );
-
-                        self.plant_corrosion_allow_m = if self.plant_dim_unit.eq_ignore_ascii_case("in") {
-                            ca_disp * 0.0254
-                        } else {
-                            ca_disp / 1000.0
-                        };
-                        self.plant_mill_tol_frac = mill_pct / 100.0;
-                    });
-                    ui.end_row();
-
-                    label_with_tip(ui, "유체 온도 [°C]", "배관 설계 온도(허용응력 선택 시 참고)");
-                    ui.add(egui::DragValue::new(&mut self.plant_service_temp_c).speed(1.0));
-                    ui.end_row();
-
-                    label_with_tip(ui, "안전율 SF (추가 여유)", "추가 보수적 여유율을 곱해 허용압을 낮춥니다.");
-                    ui.add(
-                        egui::DragValue::new(&mut self.plant_safety_factor)
-                            .speed(0.05)
-                            .clamp_range(1.0..=5.0),
-                    );
-                    ui.end_row();
-                });
-            if ui.button("내압 계산").clicked() {
-                if self.plant_pipe_od_m <= 0.0
-                    || self.plant_wall_thk_m <= 0.0
-                    || self.plant_allow_stress_mpa <= 0.0
-                {
-                    self.plant_pressure_result =
-                        Some("입력 오류: 외경/두께/강도는 0보다 커야 합니다.".into());
-                } else {
-                    // 단위 변환: mm/inch -> m
-                    let (od_m_raw, thk_m_raw) =
-                        if self.plant_dim_unit.eq_ignore_ascii_case("in") {
-                            (self.plant_pipe_od_m * 0.0254, self.plant_wall_thk_m * 0.0254)
-                        } else {
-                            (
-                                self.plant_pipe_od_m / 1000.0,
-                                self.plant_wall_thk_m / 1000.0,
-                            )
-                        };
-                    let t_net =
-                        thk_m_raw * (1.0 - self.plant_mill_tol_frac) - self.plant_corrosion_allow_m;
-                    if od_m_raw <= 0.0 || t_net <= 0.0 {
-                        self.plant_pressure_result =
-                            Some("입력 오류: 순두께가 0 이하입니다. CA/밀톨/두께를 확인하세요.".into());
-                    } else {
-                        let r_o = od_m_raw / 2.0;
-                        let r_i = r_o - t_net;
-                        if r_i <= 0.0 {
-                            self.plant_pressure_result = Some(
-                                "입력 오류: 내경이 0 이하입니다. OD/두께/CA 입력을 확인하세요.".into(),
-                            );
-                        } else {
-                            let d_over_t = od_m_raw / t_net;
-                            let s_eff_pa = self.plant_allow_stress_mpa
-                                * 1.0e6
-                                * self.plant_weld_eff
-                                * self.plant_design_factor
-                                / self.plant_safety_factor;
-
-                            let (p_hoop_pa, p_axial_pa, model) = if d_over_t > 20.0 {
-                                (
-                                    2.0 * t_net * s_eff_pa / od_m_raw,
-                                    4.0 * t_net * s_eff_pa / od_m_raw,
-                                    "얇은 관(Barlow)",
-                                )
-                            } else {
-                                let ro2 = r_o * r_o;
-                                let ri2 = r_i * r_i;
-                                (
-                                    s_eff_pa * (ro2 - ri2) / (ro2 + ri2),
-                                    s_eff_pa * (ro2 - ri2) / ri2,
-                                    "두꺼운 관(Lamé)",
-                                )
-                            };
-                            let p_allow_pa = p_hoop_pa.min(p_axial_pa);
-                            let p_allow_bar = p_allow_pa / 1.0e5;
-                            self.plant_pressure_result = Some(format!(
-                                "허용압력 ~ {:.2} bar ({} 기준, Hoop {:.2} bar, Axial {:.2} bar, D/t={:.1}, t_eff={:.2} mm, S={:.1} MPa, E={:.2}, F={:.2}, SF={:.2}, CA={:.2} mm, 밀톨={:.1}%)",
-                                p_allow_bar,
-                                model,
-                                p_hoop_pa / 1.0e5,
-                                p_axial_pa / 1.0e5,
-                                d_over_t,
-                                t_net * 1000.0,
-                                self.plant_allow_stress_mpa,
-                                self.plant_weld_eff,
-                                self.plant_design_factor,
-                                self.plant_safety_factor,
-                                self.plant_corrosion_allow_m * 1000.0,
-                                self.plant_mill_tol_frac * 100.0
-                            ));
-                        }
-                    }
-                }
-            }
-            if let Some(res) = &self.plant_pressure_result {
-                ui.label(res);
-                ui.small("참고: 입력 S는 온도별 허용응력을 직접 사용. 얇은/두꺼운 판정 자동, 코드 검증은 별도로 수행하십시오. D/t>20는 얇은 관, 그 이하는 Lamé 두꺼운 관 식을 사용.");
-            }
-        });
+        self.ui_bypass_panels(ui);
     }
+
 }
 
 impl App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
-        // 실행 시 첫 프레임에 현재 화면 해상도의 25%(가로) x 20%(세로)로 리사이즈
+        // 최초 1회 화면 크기 조정
         if self.apply_initial_view_size {
             if let Some(screen) = ctx.input(|i| {
                 let r = i.screen_rect();
@@ -3331,23 +4121,31 @@ impl App for GuiApp {
                     None
                 }
             }) {
-                // 메뉴가 충분히 보이도록 60% 스케일, 최소 1000x700 보장
-                let target = egui::vec2(
-                    (screen.x * 0.60).max(1000.0),
-                    (screen.y * 0.60).max(700.0),
-                );
+                let target = egui::vec2((screen.x * 0.60).max(1000.0), (screen.y * 0.60).max(700.0));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target));
                 self.apply_initial_view_size = false;
             }
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-            if self.always_on_top {
-                egui::WindowLevel::AlwaysOnTop
-            } else {
-                egui::WindowLevel::Normal
-            },
-        ));
-        // 진공 포화온도 외부 창
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.always_on_top {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        }));
+
+        // 투명도 적용 + 라벨 복사 방지 스타일
+        let mut style = (*ctx.style()).clone();
+        style.interaction.selectable_labels = false;
+        style.visuals.window_fill = style.visuals.window_fill.linear_multiply(self.window_alpha);
+        style.visuals.panel_fill = style.visuals.panel_fill.linear_multiply(self.window_alpha);
+        ctx.set_style(style);
+
+        let tr = self.tr.clone();
+        let txt = move |key: &str, default: &str| {
+            tr.lookup(key).unwrap_or_else(|| default.to_string())
+        };
+
+        // 외부 진공 포화 온도 창
         if self.show_vacuum_table_viewport {
             use std::cell::Cell;
             let close_flag = Cell::new(false);
@@ -3364,7 +4162,7 @@ impl App for GuiApp {
                             }
                         });
                         ui.separator();
-                        vacuum_table_ui(ui);
+                        vacuum_table_ui(ui, &txt);
                     });
                 },
             );
@@ -3372,145 +4170,136 @@ impl App for GuiApp {
                 self.show_vacuum_table_viewport = false;
             }
         }
-        // 출력 라벨 선택/드래그 복사 방지 (입력 필드는 기존대로 사용 가능)
-        let mut style = (*ctx.style()).clone();
-        style.interaction.selectable_labels = false;
-        ctx.set_style(style);
+
+        // 상단 바
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Steam Engineering Toolbox");
+                ui.heading(txt("gui.nav.app_title", "Steam Engineering Toolbox"));
                 ui.label(" | Desktop GUI");
                 ui.separator();
-                if ui.button("설정 / Settings").clicked() {
+                if ui.button(txt("gui.formula.button", "Formula reference")).clicked() {
+                    self.show_formula_modal = true;
+                }
+                if ui.button(txt("gui.settings.title", "Settings")).clicked() {
                     self.show_settings_modal = true;
                 }
-                if ui.button("도움말 / Help").clicked() {
+                if ui.button(txt("gui.about.title", "Help / About")).clicked() {
                     self.show_help_modal = true;
                 }
             });
         });
+
+        // 설정 모달
         if self.show_settings_modal {
             let mut new_unit_system = self.config.unit_system;
-            egui::Window::new("프로그램 설정 / Settings")
+            egui::Window::new(txt("gui.settings.title", "Program Settings"))
                 .collapsible(false)
                 .resizable(true)
                 .open(&mut self.show_settings_modal)
                 .show(ctx, |ui| {
-                    ui.heading("기본 설정");
-            ui.separator();
-            ui.label("단위 시스템 프리셋");
-            ui.horizontal(|ui| {
-                for (label, us) in [
-                    ("SI(Bar)", config::UnitSystem::SIBar),
-                    ("SI(Pa)", config::UnitSystem::SI),
-                    ("MKS", config::UnitSystem::MKS),
-                    ("Imperial", config::UnitSystem::Imperial),
-                ] {
-                    ui.selectable_value(&mut new_unit_system, us, label);
-                }
-            });
-            ui.label("프리셋 선택 시 현재 입력/출력 단위가 변경됩니다.");
-            ui.separator();
-            ui.label("테마");
-            ui.horizontal(|ui| {
-                if ui
-                    .selectable_value(&mut self.theme, ThemeChoice::System, "시스템")
-                    .clicked()
-                {
-                    ctx.set_visuals(egui::Visuals::default());
-                }
-                if ui
-                    .selectable_value(&mut self.theme, ThemeChoice::Light, "라이트")
-                    .clicked()
-                {
-                    ctx.set_visuals(egui::Visuals::light());
-                }
-                if ui
-                    .selectable_value(&mut self.theme, ThemeChoice::Dark, "다크")
-                    .clicked()
-                {
-                    ctx.set_visuals(egui::Visuals::dark());
-                }
-                if ui
-                    .selectable_value(&mut self.theme, ThemeChoice::SoftBlue, "옅은 블루")
-                    .clicked()
-                {
-                    let mut vis = egui::Visuals::light();
-                    vis.extreme_bg_color = egui::Color32::from_rgb(225, 237, 247);
-                    vis.panel_fill = egui::Color32::from_rgb(235, 243, 250);
-                    vis.window_fill = egui::Color32::from_rgb(240, 246, 252);
-                    vis.selection.bg_fill = egui::Color32::from_rgb(140, 180, 220);
-                    vis.hyperlink_color = egui::Color32::from_rgb(50, 100, 180);
-                    ctx.set_visuals(vis);
-                }
-            });
-            ui.separator();
-                    ui.label("기본 폰트 크기");
-                    let slider = egui::Slider::new(&mut self.font_size, 12.0..=24.0).suffix(" px");
-                    if ui.add(slider).changed() {
-                        let mut style = (*ctx.style()).clone();
-                        style.text_styles.iter_mut().for_each(|(_, v)| {
-                            v.size = self.font_size;
-                        });
-                        ctx.set_style(style);
-                    }
+                    ui.heading(txt("gui.settings.general", "General"));
                     ui.separator();
-                    ui.label("UI 배율");
+                    ui.label(txt("gui.settings.unit_preset", "Unit system preset"));
+                    ui.horizontal(|ui| {
+                        for (label, us) in [
+                            ("SI(Bar)", config::UnitSystem::SIBar),
+                            ("SI(Pa)", config::UnitSystem::SI),
+                            ("MKS", config::UnitSystem::MKS),
+                            ("Imperial", config::UnitSystem::Imperial),
+                        ] {
+                            ui.selectable_value(&mut new_unit_system, us, label);
+                        }
+                    });
+                    ui.separator();
+                    ui.label(txt("gui.settings.ui_scale", "UI scale"));
                     let scale_slider = egui::Slider::new(&mut self.ui_scale, 0.8..=1.6).suffix(" x");
                     if ui.add(scale_slider).changed() {
                         ctx.set_pixels_per_point(self.ui_scale);
                     }
                     ui.separator();
-                    ui.checkbox(&mut self.always_on_top, "창 항상 위에 두기");
-                    ui.label("필요 시 체크 해제하여 다른 창 위에 올라오지 않게 설정");
+                    ui.checkbox(&mut self.always_on_top, txt("gui.settings.always_on_top", "Always on top"));
                     ui.separator();
-                    ui.label("폰트 설정 / Font");
-                    ui.horizontal(|ui| {
-                        ui.label("사용자 폰트 경로 / Font path");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.custom_font_path)
-                                .hint_text("예: C:\\Windows\\Fonts\\malgun.ttf"),
-                        );
-                    });
-                    if ui.button("폰트 로드 / Load Font").clicked() {
-                        match load_custom_font(ctx, self.custom_font_path.trim()) {
-                            Ok(_) => self.font_load_error = None,
-                            Err(e) => self.font_load_error = Some(e),
+                    ui.label(txt("gui.settings.alpha", "Window transparency"));
+                    ui.add(egui::Slider::new(&mut self.window_alpha, 0.3..=1.0).text("alpha"));
+
+                    ui.separator();
+                    ui.label(txt("gui.settings.lang", "Language"));
+                    egui::ComboBox::from_id_source("lang_choice")
+                        .selected_text(&self.lang_input)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.lang_input, "auto".into(), txt("gui.settings.lang.auto", "System"));
+                            ui.selectable_value(&mut self.lang_input, "en-us".into(), "English (US)");
+                            ui.selectable_value(&mut self.lang_input, "ko-kr".into(), "한국어");
+                            ui.selectable_value(&mut self.lang_input, "de-de".into(), "Deutsch");
+                        });
+                    if ui.button(txt("gui.settings.save", "Save settings")).clicked() {
+                        self.config.language = self.lang_input.clone();
+                        self.config.window_alpha = self.window_alpha;
+                        // 즉시 번역기 반영
+                        let resolved = i18n::resolve_language(&self.config.language, self.config.language_pack_dir.as_deref());
+                        self.tr = i18n::Translator::new_with_pack(&resolved, self.config.language_pack_dir.as_deref());
+                        if let Err(e) = self.config.save() {
+                            self.lang_save_status = Some(format!("Save error: {e}"));
+                        } else {
+                            self.lang_save_status = Some(txt("gui.settings.saved", "Saved."));
                         }
                     }
-                    if let Some(err) = &self.font_load_error {
-                        ui.colored_label(ui.visuals().error_fg_color, format!("폰트 오류: {err}"));
-                    } else {
-                        ui.small("assets/fonts/malgun.ttf가 없으면 경로를 수동 지정하여 한글 폰트를 적용하세요.");
+                    if let Some(msg) = &self.lang_save_status {
+                        ui.label(msg);
                     }
-                    ui.separator();
-                    ui.label("※ 단위 저장/불러오기, 테마 고정 등은 추후 config.toml과 연계 예정");
                 });
             if new_unit_system != self.config.unit_system {
                 self.config.unit_system = new_unit_system;
                 self.apply_unit_preset(new_unit_system);
             }
         }
+
+        // 도움말 모달
         if self.show_help_modal {
-            egui::Window::new("도움말 / Help / About")
+            egui::Window::new(txt("gui.about.title", "Help / About"))
                 .collapsible(false)
                 .resizable(true)
                 .open(&mut self.show_help_modal)
                 .show(ctx, |ui| {
-                    ui.heading("Steam Engineering Toolbox");
-                    ui.label("증기/수/배관/밸브 계산 오프라인 도구");
-                    ui.label("버전: 0.1a");
-                    ui.label("제작자: 김민석");
+                    ui.heading(txt("gui.about.app", "Offline calculator for steam/water/piping/valves"));
+                    ui.label(txt("gui.about.version", "Version: 0.1a"));
+                    ui.label(txt("gui.about.author", "Author: ruassu"));
                     ui.separator();
-                    ui.label("단위 가이드");
-                    ui.label("- 압력 mmHg: 게이지 기준(0=대기, -760mmHg=진공)");
-                    ui.label("- g=게이지, a=절대");
-                    ui.separator();
-                    ui.label(
-                        "오류나 개선 제안이 있으면 설정에서 단위/폰트를 조정하거나 문의하세요.",
-                    );
+                    ui.label(txt("gui.about.units.title", "Unit guide"));
+                    ui.label(txt("gui.about.units.mmHg", "- Pressure mmHg: gauge basis (0=atm, -760mmHg=vacuum)"));
+                    ui.label(txt("gui.about.units.ga", "- g=gauge, a=absolute"));
+                    ui.label(txt("gui.about.hint", "Adjust units/font in settings if you see issues."));
                 });
         }
+
+        if self.show_formula_modal {
+            egui::Window::new(txt("gui.formula.title", "Formula reference"))
+                .collapsible(true)
+                .resizable(true)
+                .open(&mut self.show_formula_modal)
+                .show(ctx, |ui| {
+                    ui.style_mut().wrap = Some(true);
+                    ui.heading(txt("gui.formula.steam", "Steam: IF97 saturation/superheat; mmHg treated as gauge."));
+                    ui.separator();
+                    ui.heading(txt("gui.formula.pipe_sizing", "Pipe sizing: mdot = rho * Q, v = Q/A, Re = rho * v * D / mu."));
+                    ui.label(txt("gui.formula.pipe_loss", "Pressure loss: ΔP = f (L/D) (rho v^2/2) + ΣK (rho v^2/2); f=64/Re (laminar) else Haaland/Petukhov."));
+                    ui.separator();
+                    ui.heading(txt("gui.formula.valve", "Valve Cv/Kv: Q = Cv * sqrt(ΔP / SG) (incompressible); mass = rho*Q."));
+                    ui.label(txt("gui.formula.orifice", "Orifice/nozzle: incompressible Q = Cd·A·√(2·ΔP/ρ); compressible uses Y·C(1-β^4)^-0.5."));
+                    ui.label(txt("gui.formula.pressure_rating", "Pressure rating: thin-wall (Barlow) vs thick-wall (Lame) using allowable stress S(T), weld eff. E, design factor F, CA, mill tolerance."));
+                    ui.label(txt("gui.formula.expansion", "Thermal expansion: ΔL = α * L * ΔT."));
+                    ui.separator();
+                    ui.heading(txt("gui.formula.boiler_basic", "Boiler basic eff.: η = (m_s*h_s - m_fw*h_fw) / (Fuel_LHV*Fuel_flow)."));
+                    ui.label(txt("gui.formula.boiler_ptc", "PTC: include flue-gas sensible losses, excess air, radiation, blowdown enthalpy."));
+                    ui.separator();
+                    ui.heading(txt("gui.formula.cooling_cond", "Condenser/vacuum: LMTD with Tsat(P) from IF97; Q = m·cp·ΔT; mmHg gauge = vacuum."));
+                    ui.label(txt("gui.formula.cooling_ct", "Cooling tower: Range = T_hot - T_cold, Approach = T_cold - T_wb; simple heat balance."));
+                    ui.label(txt("gui.formula.npsh", "NPSH: NPSHa = (Psuction - Pvap)/ρg + z - h_loss; compare to NPSHr."));
+                    ui.label(txt("gui.formula.drain", "Drain/reheater: LMTD; UA or Area/U to compute Q_shell and Q_tube, check imbalance."));
+                });
+        }
+
+        // 좌측 네비 + 본문
         egui::SidePanel::left("nav")
             .resizable(true)
             .min_width(140.0)
@@ -3518,20 +4307,19 @@ impl App for GuiApp {
             .max_width(400.0)
             .show(ctx, |ui| {
                 self.ui_nav(ui);
-        });
+            });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    match self.tab {
-                        Tab::UnitConv => self.ui_unit_conv(ui),
-                        Tab::SteamTables => self.ui_steam_tables(ui),
-                        Tab::SteamPiping => self.ui_steam_piping(ui),
-                        Tab::SteamValves => self.ui_steam_valves(ui),
-                        Tab::Boiler => self.ui_boiler(ui),
-                        Tab::Cooling => self.ui_cooling(ui),
-                        Tab::PlantPiping => self.ui_plant_piping(ui),
-                    };
+                .show(ui, |ui| match self.tab {
+                    Tab::UnitConv => self.ui_unit_conv(ui),
+                    Tab::SteamTables => self.ui_steam_tables(ui),
+                    Tab::SteamPiping => self.ui_steam_piping(ui),
+                    Tab::SteamValves => self.ui_steam_valves(ui),
+                    Tab::Boiler => self.ui_boiler(ui),
+                    Tab::Cooling => self.ui_cooling(ui),
+                    Tab::PlantPiping => self.ui_plant_piping(ui),
                 });
         });
     }
@@ -3583,34 +4371,10 @@ fn default_units_for_kind(kind: QuantityKind) -> (&'static str, &'static str) {
 
 fn unit_options(kind: QuantityKind) -> &'static [(&'static str, &'static str)] {
     match kind {
-        QuantityKind::Temperature => &[
-            ("Celsius (°C)", "C"),
-            ("Kelvin (K)", "K"),
-            ("Fahrenheit (°F)", "F"),
-            ("Rankine (R)", "R"),
-        ],
-        QuantityKind::TemperatureDifference => {
-            &[("Δ°C", "C"), ("ΔK", "K"), ("Δ°F", "F"), ("ΔR", "R")]
-        }
-        QuantityKind::Pressure => &[
-            ("bar(g)", "bar"),
-            ("bar(a)", "bara"),
-            ("kPa", "kPa"),
-            ("MPa", "MPa"),
-            ("psi", "psi"),
-            ("atm", "atm"),
-            ("Pa", "Pa"),
-            ("mmHg", "mmHg"),
-        ],
-        QuantityKind::Length => &[
-            ("m", "m"),
-            ("mm", "mm"),
-            ("cm", "cm"),
-            ("inch", "in"),
-            ("ft", "ft"),
-            ("yd", "yd"),
-            ("km", "km"),
-        ],
+        QuantityKind::Temperature => &[("Celsius (°C)", "C"), ("Kelvin (K)", "K"), ("Fahrenheit (°F)", "F"), ("Rankine (R)", "R")],
+        QuantityKind::TemperatureDifference => &[("Δ°C", "C"), ("ΔK", "K"), ("Δ°F", "F"), ("ΔR", "R")],
+        QuantityKind::Pressure => &[("bar(g)", "bar"), ("bar(a)", "bara"), ("kPa", "kPa"), ("MPa", "MPa"), ("psi", "psi"), ("atm", "atm"), ("Pa", "Pa"), ("mmHg", "mmHg")],
+        QuantityKind::Length => &[("m", "m"), ("mm", "mm"), ("cm", "cm"), ("inch", "in"), ("ft", "ft"), ("yd", "yd"), ("km", "km")],
         QuantityKind::Area => &[("m²", "m2"), ("ft²", "ft2")],
         QuantityKind::Volume => &[("m³", "m3"), ("L", "l"), ("mL", "ml"), ("ft³", "ft3")],
         QuantityKind::Velocity => &[("m/s", "m/s"), ("km/h", "km/h"), ("ft/s", "ft/s")],
@@ -3648,16 +4412,7 @@ fn unit_combo(ui: &mut egui::Ui, value: &mut String, options: &[(&str, &str)]) {
 }
 
 fn pressure_unit_options() -> &'static [(&'static str, &'static str)] {
-    &[
-        ("bar(g)", "bar"),
-        ("bar(a)", "bara"),
-        ("kPa", "kPa"),
-        ("MPa", "MPa"),
-        ("psi", "psi"),
-        ("atm", "atm"),
-        ("Pa", "Pa"),
-        ("mmHg", "mmHg"),
-    ]
+    &[("bar(g)", "bar"), ("bar(a)", "bara"), ("kPa", "kPa"), ("MPa", "MPa"), ("psi", "psi"), ("atm", "atm"), ("Pa", "Pa"), ("mmHg", "mmHg")]
 }
 
 fn temperature_unit_options() -> &'static [(&'static str, &'static str)] {
@@ -3681,14 +4436,12 @@ fn convert_temperature_gui(v: f64, from: &str, to: &str) -> f64 {
 }
 
 fn convert_massflow_gui(v: f64, from: &str, to: &str) -> f64 {
-    // 지원: kg/h, t/h, kg/s, lb/h
     let to_lower = |s: &str| s.to_ascii_lowercase();
     let from_l = to_lower(from);
     let to_l = to_lower(to);
     if from_l == to_l {
         return v;
     }
-    // 먼저 kg/h로 변환
     let kg_per_h = match from_l.as_str() {
         "kg/h" => v,
         "t/h" | "ton/h" | "tonne/h" => v * 1000.0,
@@ -3696,7 +4449,6 @@ fn convert_massflow_gui(v: f64, from: &str, to: &str) -> f64 {
         "lb/h" => v * 0.45359237,
         _ => v,
     };
-    // 대상 변환
     match to_l.as_str() {
         "kg/h" => kg_per_h,
         "t/h" | "ton/h" | "tonne/h" => kg_per_h / 1000.0,
@@ -3715,7 +4467,6 @@ fn convert_length_gui(v: f64, from: &str, to: &str) -> f64 {
 }
 
 fn convert_flow_gui(v: f64, from: &str, rho_unit: &str, rho: f64) -> f64 {
-    // volumetric m3/h 또는 질량 kg/h 선택
     if from.eq_ignore_ascii_case("kg/h") {
         v / convert_density_gui(rho, rho_unit, "kg/m3")
     } else if from.eq_ignore_ascii_case("t/h") {
@@ -3723,11 +4474,9 @@ fn convert_flow_gui(v: f64, from: &str, rho_unit: &str, rho: f64) -> f64 {
     } else if from.eq_ignore_ascii_case("kg/s") {
         (v * 3600.0) / convert_density_gui(rho, rho_unit, "kg/m3")
     } else if from.eq_ignore_ascii_case("lb/h") {
-        // lb/h -> kg/h -> m3/h
         let kg_h = v * 0.45359237;
         kg_h / convert_density_gui(rho, rho_unit, "kg/m3")
     } else if from.eq_ignore_ascii_case("gpm") {
-        // US gallon per minute -> m3/h
         v * 0.2271247
     } else {
         v
@@ -3847,8 +4596,10 @@ mod tests {
             roughness_m: 0.000045,
             dynamic_viscosity_pa_s: 1.2e-5,
             sound_speed_m_per_s: 300.0,
+            state_pressure_bar_abs: Some(1.01325),
+            state_temperature_c: Some(100.0),
         };
         let res = pressure_loss(input).unwrap();
-        assert!((res.mach - 0.424).abs() < 0.01, "mach={}", res.mach);
+        assert!((res.mach - 0.71).abs() < 0.02, "mach={}", res.mach);
     }
 }

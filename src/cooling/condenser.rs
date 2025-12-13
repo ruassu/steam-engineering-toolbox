@@ -67,14 +67,13 @@ fn log_mean(delta1: f64, delta2: f64) -> Option<f64> {
 /// 콘덴서 열수지와 진공 수준을 계산한다.
 pub fn compute_condenser(input: CondenserInput) -> Result<CondenserResult, CoolingError> {
     // 압력을 bar(abs)로 변환
-    let p_bar_abs =
-        crate::conversion::convert_pressure_mode(
-            input.steam_pressure,
-            input.steam_pressure_unit,
-            input.steam_pressure_mode,
-            PressureUnit::Bar,
-            PressureMode::Absolute,
-        );
+    let p_bar_abs = crate::conversion::convert_pressure_mode(
+        input.steam_pressure,
+        input.steam_pressure_unit,
+        input.steam_pressure_mode,
+        PressureUnit::Bar,
+        PressureMode::Absolute,
+    );
 
     // 포화 온도/압력 계산
     let (tsat_c, psat_bar_abs) = if let Some(t) = input.steam_temp_c {
@@ -98,9 +97,12 @@ pub fn compute_condenser(input: CondenserInput) -> Result<CondenserResult, Cooli
     let q_kw_from_water = m_cw * cp * (input.cw_outlet_temp_c - input.cw_inlet_temp_c);
 
     // UA로부터의 Q 추정 (선택)
-    let ua_kw_per_k = input
-        .ua_kw_per_k
-        .or_else(|| input.area_m2.zip(input.overall_u_w_m2k).map(|(a, u)| a * u / 1000.0));
+    let ua_kw_per_k = input.ua_kw_per_k.or_else(|| {
+        input
+            .area_m2
+            .zip(input.overall_u_w_m2k)
+            .map(|(a, u)| a * u / 1000.0)
+    });
     let q_kw = if let Some(ua) = ua_kw_per_k {
         ua * lmtd
     } else {
@@ -109,7 +111,8 @@ pub fn compute_condenser(input: CondenserInput) -> Result<CondenserResult, Cooli
 
     let mut warnings = Vec::new();
     if d1 <= 0.0 || d2 <= 0.0 {
-        warnings.push("냉각수 출구/입구 온도가 포화온도 이상입니다. 역류 또는 센서 오류 가능".into());
+        warnings
+            .push("냉각수 출구/입구 온도가 포화온도 이상입니다. 역류 또는 센서 오류 가능".into());
     }
     if let Some(target) = input.target_back_pressure_bar_abs {
         if psat_bar_abs > target {

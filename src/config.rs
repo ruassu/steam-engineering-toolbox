@@ -17,8 +17,15 @@ pub enum UnitSystem {
     Imperial,
 }
 
+impl Default for UnitSystem {
+    fn default() -> Self {
+        UnitSystem::SIBar
+    }
+}
+
 /// 각 물리량별 기본 단위 설정을 담는다.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DefaultUnits {
     pub temperature: TemperatureUnit,
     pub temperature_diff: TemperatureDiffUnit,
@@ -58,15 +65,28 @@ impl Default for DefaultUnits {
 /// 애플리케이션 설정을 표현한다.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default = "default_language")]
+    pub language: String,
+    /// 언어팩 디렉터리 (예: locales). 없으면 내장 문자열 사용.
+    #[serde(default)]
+    pub language_pack_dir: Option<String>,
+    #[serde(default)]
     pub unit_system: UnitSystem,
+    #[serde(default = "DefaultUnits::default")]
     pub default_units: DefaultUnits,
+    /// 창 투명도(1.0=불투명, 0.3=높은 투명)
+    #[serde(default = "default_window_alpha")]
+    pub window_alpha: f32,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
+            language: default_language(),
+            language_pack_dir: None,
             unit_system: UnitSystem::SIBar,
             default_units: DefaultUnits::default(),
+            window_alpha: default_window_alpha(),
         }
     }
 }
@@ -137,4 +157,12 @@ impl Config {
     pub fn save(&self) -> Result<(), ConfigError> {
         save_config(self)
     }
+}
+
+fn default_language() -> String {
+    "en-us".to_string()
+}
+
+fn default_window_alpha() -> f32 {
+    1.0
 }
