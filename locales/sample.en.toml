@@ -1,0 +1,8 @@
+# Example language pack (en). Copy to locales/en.toml and edit.
+help.unit_conversion = "Help: quantity -> value -> from/to units."
+help.steam_tables = "Help: pick unit (mmHg is gauge; bar/psi/atm follow abs/gauge)."
+help.steam_piping_sizing = "Help: mass flow, pressure (abs/g), temp, target velocity."
+help.steam_piping_drop = "Help: density 0 = auto; diameter accepts mm/inch; K/equiv len can be 0."
+help.steam_valves_required = "Help: flow, delta-P, density -> required Kv/Cv."
+help.steam_valves_flow = "Help: Kv/Cv, delta-P, density, upstream P -> flow."
+help.settings = "Help: choose unit preset."
