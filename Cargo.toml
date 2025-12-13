@@ -1,6 +1,6 @@
 [package]
 name = "steam_engineering_toolbox"
-version = "1.0.0-a"
+version = "1.0.1"
 edition = "2021"
 default-run = "steam_engineering_toolbox"
 
@@ -18,3 +18,6 @@ toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 eframe = "0.27"
 seuif97 = "1.1.4"
+sys-locale = "0.3"
+rfd = "0.14"
+image = { version = "0.24", default-features = false, features = ["png"] }

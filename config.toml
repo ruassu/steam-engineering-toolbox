@@ -1,4 +1,6 @@
+language = "auto"
 unit_system = "SIBar"
+window_alpha = 1.0
 
 [default_units]
 temperature = "Celsius"

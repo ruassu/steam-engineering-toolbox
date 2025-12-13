@@ -36,8 +36,8 @@ Release artifacts: `target/release/steam_engineering_toolbox.exe` and `steam_eng
 
 ## Run
 - GUI: `steam_engineering_toolbox.exe`
-- CLI: `steam_engineering_toolbox_cli --help` for usage
-- Config: adjust default units/options via `config.toml` in the run directory
+- CLI: `steam_engineering_toolbox_cli --help` for usage (`--lang en-us|en-uk|ko-kr|auto`; auto = config → system locale → en-us)
+- Config: adjust defaults via `config.toml` (set `language = "en-us|en-uk|ko-kr|auto"`; `language_pack_dir = "locales"` to load external language packs at `<dir>/<lang>.toml`)
 
 ## Consumer Usage (GUI/CLI package)
 - Download the release zip from GitHub Releases and extract it to a writable folder (no install needed).
@@ -47,7 +47,7 @@ Release artifacts: `target/release/steam_engineering_toolbox.exe` and `steam_eng
 
 ## Release/Distribution Guide
 - Commit source only; upload built binaries to GitHub Releases.
-- Example package: `steam_engineering_toolbox_1.0.0-a_windows.zip` containing `steam_engineering_toolbox.exe`, `steam_engineering_toolbox_cli.exe`, and `config.toml`.
+- Example package: `steam_engineering_toolbox_1.0.1_windows.zip` containing `steam_engineering_toolbox.exe`, `steam_engineering_toolbox_cli.exe`, and `config.toml`.
 
 ## Input Tips
 - Default pipe roughness epsilon: carbon steel ~0.000045 m.
@@ -57,6 +57,7 @@ Release artifacts: `target/release/steam_engineering_toolbox.exe` and `steam_eng
 ## Dependencies
 - `seuif97` (steam IF97 calculations)
 - `eframe/egui` (desktop GUI)
+- (Optional) external language packs under `locales/` (built-in: en-us, en-uk, ko-kr)
 
 ## 한국어 요약
 - 개요: 중앙전력망 연계 기력/복합발전소 유지보수·유틸리티 엔지니어용 오프라인 열기계 계산기입니다.
@@ -64,5 +65,5 @@ Release artifacts: `target/release/steam_engineering_toolbox.exe` and `steam_eng
 - 동작: IF97 증기 물성(밀도/점도 수동 입력 가능), Darcy-Weisbach+Haaland/Petukhov 마찰계수, 층류 64/Re, 피팅 K·등가길이, 음속 입력 시 Mach 계산. GUI는 상호작용, CLI는 배치/스크립트용이며 둘 다 `config.toml` 기본값을 읽습니다.
 - 핵심 기능: 압손, Cv/Kv/오리피스, 냉각탑·콘덴서·NPSH, 단위 변환, 기본 설정 파일.
 - 빌드/테스트: Rust 1.75+; `cargo test`, `cargo build --release`; 산출물은 `target/release/steam_engineering_toolbox.exe`, `steam_engineering_toolbox_cli.exe`.
-- 소비자용 사용법: Releases zip을 풀어 GUI는 `steam_engineering_toolbox.exe`, CLI는 `steam_engineering_toolbox_cli --help` 후 `pressure-drop` 등 서브커맨드 사용. 물성이 의심되면 밀도/점도를 수동 입력해 바로 반영합니다.
+- 소비자용 사용법: Releases zip을 풀어 GUI는 `steam_engineering_toolbox.exe`, CLI는 `steam_engineering_toolbox_cli --help` 후 `pressure-drop` 등 서브커맨드 사용 (`--lang en|ko|auto`로 언어 선택 가능, config.toml의 `language`가 기본). 물성이 의심되면 밀도/점도를 수동 입력해 바로 반영합니다.
 - 배포/가치: 소스만 커밋하고, 빌드 결과는 Releases에 `steam_engineering_toolbox.exe`, `steam_engineering_toolbox_cli.exe`, `config.toml`을 묶어 올립니다. 목표는 보안성(폐쇄망), 정확성(공학 정밀도), 편리성(GUI/CLI), 신뢰성(저사양 호환)입니다.
